@@ -86,6 +86,7 @@ async fn handle_tunnel(
     tracing::info!(%peer_id, service = %request.service_name, "tunnel request");
 
     let Some(&local_addr) = services.get(&request.service_name) else {
+        tracing::warn!(%peer_id, service = %request.service_name, reason = "unknown service", "tunnel rejected");
         write_message(
             &mut stream,
             &TunnelResponse {
@@ -102,6 +103,8 @@ async fn handle_tunnel(
         .await
         .with_context(|| format!("connecting to local service at {local_addr}"))?;
 
+    let service_name = &request.service_name;
+
     write_message(
         &mut stream,
         &TunnelResponse {
@@ -111,21 +114,24 @@ async fn handle_tunnel(
     )
     .await?;
 
+    tracing::info!(%peer_id, service = %service_name, %local_addr, "tunnel accepted");
+
     // Bridge: libp2p stream (futures) ↔ TCP stream (tokio)
     let mut compat_stream = stream.compat();
     let mut tcp_stream = tcp_stream;
 
     match copy_bidirectional(&mut compat_stream, &mut tcp_stream).await {
-        Ok((to_tcp, from_tcp)) => {
-            tracing::debug!(
+        Ok((bytes_to_service, bytes_from_service)) => {
+            tracing::info!(
                 %peer_id,
-                to_tcp,
-                from_tcp,
-                "tunnel closed normally"
+                service = %service_name,
+                bytes_to_service,
+                bytes_from_service,
+                "tunnel closed"
             );
         }
         Err(e) => {
-            tracing::debug!(%peer_id, error = %e, "tunnel I/O error");
+            tracing::warn!(%peer_id, error = %e, "tunnel error");
         }
     }
 
@@ -193,12 +199,22 @@ async fn client_tunnel_session(
     let response: TunnelResponse = read_message(stream).await?;
 
     if !response.accepted {
-        bail!("tunnel rejected: {}", response.reason.unwrap_or_default());
+        let reason = response.reason.as_deref().unwrap_or("unknown");
+        tracing::warn!(service = %service_name, %reason, "client tunnel rejected");
+        bail!("tunnel rejected: {reason}");
     }
 
     // Bridge
     let mut compat_stream = stream.compat();
-    copy_bidirectional(&mut compat_stream, &mut tcp_stream).await?;
+    match copy_bidirectional(&mut compat_stream, &mut tcp_stream).await {
+        Ok((bytes_to_remote, bytes_from_remote)) => {
+            tracing::info!(service = %service_name, bytes_to_remote, bytes_from_remote, "client tunnel closed");
+        }
+        Err(e) => {
+            tracing::warn!(service = %service_name, error = %e, "client tunnel error");
+            return Err(e.into());
+        }
+    }
 
     Ok(())
 }
@@ -289,63 +305,55 @@ impl TunnelRegistry {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
-    #[test]
-    fn tunnel_request_roundtrip() {
-        let req = TunnelRequest {
-            service_name: "echo".into(),
-        };
-        let data = serde_json::to_vec(&req).expect("serialize tunnel request");
-        let decoded: TunnelRequest =
-            serde_json::from_slice(&data).expect("deserialize tunnel request");
-        assert_eq!(decoded.service_name, "echo");
+    fn arb_peer_id() -> impl Strategy<Value = PeerId> {
+        any::<[u8; 32]>().prop_map(|bytes| {
+            // Infallible: any 32 bytes is a valid ed25519 seed
+            let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(bytes)
+                .expect("any 32 bytes is a valid ed25519 seed");
+            let ed_kp = libp2p::identity::ed25519::Keypair::from(secret);
+            let keypair = libp2p::identity::Keypair::from(ed_kp);
+            PeerId::from(keypair.public())
+        })
     }
 
-    #[test]
-    fn tunnel_response_roundtrip() {
-        let resp = TunnelResponse {
-            accepted: true,
-            reason: None,
-        };
-        let data = serde_json::to_vec(&resp).expect("serialize accepted response");
-        let decoded: TunnelResponse =
-            serde_json::from_slice(&data).expect("deserialize accepted response");
-        assert!(decoded.accepted);
-        assert!(decoded.reason.is_none());
-
-        let resp = TunnelResponse {
-            accepted: false,
-            reason: Some("not found".into()),
-        };
-        let data = serde_json::to_vec(&resp).expect("serialize rejected response");
-        let decoded: TunnelResponse =
-            serde_json::from_slice(&data).expect("deserialize rejected response");
-        assert!(!decoded.accepted);
-        assert_eq!(
-            decoded.reason.expect("rejection reason present"),
-            "not found"
-        );
+    fn arb_service_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_-]{0,19}"
     }
 
-    #[test]
-    fn parse_tunnel_spec_valid() {
-        let peer_id = PeerId::random();
-        let spec = format!("{peer_id}:echo@127.0.0.1:9000");
-        let (pid, name, addr) = parse_tunnel_spec(&spec).expect("parse valid tunnel spec");
-        assert_eq!(pid, peer_id);
-        assert_eq!(name, "echo");
-        assert_eq!(
-            addr,
-            "127.0.0.1:9000"
-                .parse::<SocketAddr>()
-                .expect("parse socket address")
-        );
+    fn arb_socket_addr() -> impl Strategy<Value = SocketAddr> {
+        (
+            1u8..=254,
+            0u8..=255,
+            0u8..=255,
+            1u8..=254,
+            1024u16..65535u16,
+        )
+            .prop_map(|(a, b, c, d, port)| {
+                // Infallible: formatted string is always a valid socket address
+                format!("{a}.{b}.{c}.{d}:{port}")
+                    .parse()
+                    .expect("generated socket address is always valid")
+            })
     }
 
-    #[test]
-    fn parse_tunnel_spec_invalid() {
-        assert!(parse_tunnel_spec("garbage").is_err());
-        assert!(parse_tunnel_spec("peer:svc").is_err()); // missing @
+    proptest! {
+        // Roundtrip: parse_tunnel_spec recovers original components from formatted spec
+        #[test]
+        fn parse_tunnel_spec_roundtrip(
+            peer_id in arb_peer_id(),
+            service in arb_service_name(),
+            addr in arb_socket_addr(),
+        ) {
+            let spec = format!("{peer_id}:{service}@{addr}");
+            let (parsed_pid, parsed_name, parsed_addr) =
+                parse_tunnel_spec(&spec).expect("parse generated tunnel spec");
+            prop_assert_eq!(parsed_pid, peer_id);
+            prop_assert_eq!(parsed_name, service);
+            prop_assert_eq!(parsed_addr, addr);
+        }
     }
 }

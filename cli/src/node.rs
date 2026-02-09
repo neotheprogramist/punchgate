@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, autonat, identify, kad, mdns, noise, relay, swarm::SwarmEvent,
-    yamux,
+    Multiaddr, PeerId, SwarmBuilder, autonat, identify, kad, mdns, noise, ping, relay,
+    swarm::SwarmEvent, yamux,
 };
 
 use crate::{
@@ -179,6 +179,14 @@ pub async fn run(
 
         tokio::select! {
             event = swarm.select_next_some() => {
+                // Log all connection events for observability
+                if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
+                    tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
+                }
+                if let SwarmEvent::ConnectionClosed { peer_id, num_established, .. } = &event {
+                    tracing::info!(peer = %peer_id, remaining = num_established, "connection closed");
+                }
+
                 // Check if a bootstrap peer reconnected
                 if let SwarmEvent::ConnectionEstablished { peer_id, .. } = &event
                     && bootstrap_peer_ids.contains(peer_id)
@@ -205,7 +213,19 @@ pub async fn run(
                     &event,
                     &bootstrap_peer_ids,
                 ) {
+                    let old_phase = peer_state.phase;
+                    let event_label = event_name(&state_event);
                     let (new_state, commands) = peer_state.transition(state_event);
+                    tracing::debug!(event = event_label, commands = commands.len(), "event processed");
+                    if old_phase != new_state.phase {
+                        tracing::info!(
+                            event = event_label,
+                            from = phase_name(old_phase),
+                            to = phase_name(new_state.phase),
+                            commands = commands.len(),
+                            "phase transition"
+                        );
+                    }
                     peer_state = new_state;
                     execute_commands(
                         &mut swarm,
@@ -220,7 +240,18 @@ pub async fn run(
             }
             _ = &mut discovery_deadline, if !discovery_timeout_fired => {
                 discovery_timeout_fired = true;
+                let old_phase = peer_state.phase;
                 let (new_state, commands) = peer_state.transition(Event::DiscoveryTimeout);
+                tracing::debug!(event = "DiscoveryTimeout", commands = commands.len(), "event processed");
+                if old_phase != new_state.phase {
+                    tracing::info!(
+                        event = "DiscoveryTimeout",
+                        from = phase_name(old_phase),
+                        to = phase_name(new_state.phase),
+                        commands = commands.len(),
+                        "phase transition"
+                    );
+                }
                 peer_state = new_state;
                 execute_commands(&mut swarm, &commands, &exposed);
             }
@@ -261,7 +292,18 @@ pub async fn run(
                 }
             }
             _ = tokio::signal::ctrl_c() => {
+                let old_phase = peer_state.phase;
                 let (new_state, commands) = peer_state.transition(Event::ShutdownRequested);
+                tracing::debug!(event = "ShutdownRequested", commands = commands.len(), "event processed");
+                if old_phase != new_state.phase {
+                    tracing::info!(
+                        event = "ShutdownRequested",
+                        from = phase_name(old_phase),
+                        to = phase_name(new_state.phase),
+                        commands = commands.len(),
+                        "phase transition"
+                    );
+                }
                 peer_state = new_state;
                 execute_commands(&mut swarm, &commands, &exposed);
                 if peer_state.phase == Phase::ShuttingDown {
@@ -391,7 +433,13 @@ fn translate_behaviour_event(event: &BehaviourEvent) -> Option<Event> {
         },
 
         BehaviourEvent::RelayServer(_) => None,
-        BehaviourEvent::Ping(_) => None,
+        BehaviourEvent::Ping(ping::Event { peer, result, .. }) => {
+            match result {
+                Ok(rtt) => tracing::info!(%peer, rtt = ?rtt, "ping"),
+                Err(e) => tracing::warn!(%peer, error = %e, "ping failed"),
+            }
+            None
+        }
         BehaviourEvent::Stream(()) => None,
     }
 }
@@ -502,4 +550,33 @@ fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
             None
         }
     })
+}
+
+fn event_name(event: &Event) -> &'static str {
+    match event {
+        Event::ListeningOn { .. } => "ListeningOn",
+        Event::BootstrapConnected { .. } => "BootstrapConnected",
+        Event::ShutdownRequested => "ShutdownRequested",
+        Event::KademliaBootstrapOk => "KademliaBootstrapOk",
+        Event::KademliaBootstrapFailed { .. } => "KademliaBootstrapFailed",
+        Event::MdnsDiscovered { .. } => "MdnsDiscovered",
+        Event::MdnsExpired { .. } => "MdnsExpired",
+        Event::PeerIdentified { .. } => "PeerIdentified",
+        Event::NatStatusChanged(_) => "NatStatusChanged",
+        Event::DiscoveryTimeout => "DiscoveryTimeout",
+        Event::RelayReservationAccepted { .. } => "RelayReservationAccepted",
+        Event::RelayReservationFailed { .. } => "RelayReservationFailed",
+        Event::HolePunchSucceeded { .. } => "HolePunchSucceeded",
+        Event::HolePunchFailed { .. } => "HolePunchFailed",
+        Event::ConnectionLost { .. } => "ConnectionLost",
+    }
+}
+
+fn phase_name(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Initializing => "Initializing",
+        Phase::Discovering => "Discovering",
+        Phase::Participating => "Participating",
+        Phase::ShuttingDown => "ShuttingDown",
+    }
 }

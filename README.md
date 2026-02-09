@@ -26,11 +26,11 @@ Events go in, a new state and a list of commands come out. Commands are data des
 
 **Decision:** The peer state is a product (struct) of independent dimensions, each a coproduct (enum):
 
-| Dimension | Values |
-|-----------|--------|
-| **Phase** | `Initializing` → `Discovering` → `Participating` → `ShuttingDown` |
-| **NatStatus** | `Unknown` \| `Public` \| `Private` |
-| **RelayState** | `Idle` \| `Requesting` \| `Reserved` |
+| Dimension      | Values                                                            |
+| -------------- | ----------------------------------------------------------------- |
+| **Phase**      | `Initializing` → `Discovering` → `Participating` → `ShuttingDown` |
+| **NatStatus**  | `Unknown` \| `Public` \| `Private`                                |
+| **RelayState** | `Idle` \| `Requesting` \| `Reserved`                              |
 
 **Justification:** Each dimension evolves independently. An mDNS discovery event updates `known_peers` but never touches `Phase` or `NatStatus`. A NAT status change may trigger a relay reservation but never alters the Kademlia bootstrap state. This orthogonality eliminates a combinatorial explosion of states — instead of `4 × 3 × 3 = 36` hand-written transitions, each dimension has its own focused logic. Tests verify orthogonality explicitly (e.g., `mdns_does_not_affect_phase_or_nat`).
 
@@ -77,21 +77,33 @@ cli/src/
 ├── node.rs          # Swarm event loop (translate → transition → execute)
 ├── service.rs       # Service advertisement via Kademlia DHT
 └── tunnel.rs        # Tunnel lifecycle (accept, connect, registry)
+
+scripts/
+├── echo_server.py      # TCP echo server for testing
+├── e2e_tunnel_test.sh  # Automated E2E test (saves logs to logs/)
+├── log_parse.py        # Shared structured log parser
+├── log_summary.py      # Quick one-page peer overview
+├── log_connections.py   # Connection topology analysis
+├── log_latency.py      # Ping RTT statistics
+├── log_tunnels.py      # Tunnel throughput metrics
+└── log_phases.py       # State machine lifecycle analysis
+
+logs/                   # Peer logs (auto-populated by e2e test, gitignored)
 ```
 
 The nine sub-behaviours composed into a single `NetworkBehaviour`:
 
-| Behaviour | Purpose |
-|-----------|---------|
-| **Kademlia** | Distributed hash table for peer and service discovery |
-| **mDNS** | Zero-config LAN peer discovery |
-| **Identify** | Exchange peer metadata on connection |
-| **AutoNAT** | Determine NAT reachability status |
-| **Relay (server)** | Act as relay for other NAT'd peers |
-| **Relay (client)** | Use relays when behind NAT |
-| **DCUtR** | Direct Connection Upgrade through Relay (hole punching) |
-| **Ping** | Keepalive and latency measurement |
-| **Stream** | Custom protocol streams for tunneling |
+| Behaviour          | Purpose                                                 |
+| ------------------ | ------------------------------------------------------- |
+| **Kademlia**       | Distributed hash table for peer and service discovery   |
+| **mDNS**           | Zero-config LAN peer discovery                          |
+| **Identify**       | Exchange peer metadata on connection                    |
+| **AutoNAT**        | Determine NAT reachability status                       |
+| **Relay (server)** | Act as relay for other NAT'd peers                      |
+| **Relay (client)** | Use relays when behind NAT                              |
+| **DCUtR**          | Direct Connection Upgrade through Relay (hole punching) |
+| **Ping**           | Keepalive and latency measurement                       |
+| **Stream**         | Custom protocol streams for tunneling                   |
 
 ## Quick Start
 
@@ -138,6 +150,7 @@ cargo run -p cli -- \
 ```
 
 Note the peer ID and listening address printed by Peer B, e.g.:
+
 ```
 INFO cli::identity: generated new identity peer_id=12D3KooW...
 INFO cli::node:     listening on /ip4/127.0.0.1/tcp/54321
@@ -162,6 +175,7 @@ echo "hello punchgate" | nc 127.0.0.1 9000
 ```
 
 You should see `hello punchgate` echoed back. The echo server in Terminal 1 will log the bytes it received and sent. The data traveled:
+
 ```
 nc → TCP:9000 → Peer A → libp2p stream → Peer B → TCP:7777 → echo server → back
 ```
@@ -176,7 +190,7 @@ The same flow as above, fully automated in a single command:
 ./scripts/e2e_tunnel_test.sh
 ```
 
-The script builds the binary, starts the echo server, launches both peers, waits for readiness via log polling, sends the test payload, verifies the echo, and cleans up. On failure it preserves logs for debugging.
+The script builds the binary, starts the echo server, launches both peers, waits for readiness via log polling, sends the test payload, verifies the echo, and cleans up. Logs are always saved to `logs/` for post-hoc analysis (see [Observability](#observability) below). On failure it also preserves raw logs in the temp directory.
 
 ### Automated Integration Test
 
@@ -187,21 +201,160 @@ cargo test -p cli --test integration -- three_peer_tunnel
 ```
 
 This test:
+
 1. Spawns three libp2p swarms (A, B, C) with TCP on random ports
 2. Starts a TCP echo server
 3. B registers to accept tunnel streams and exposes the echo service
 4. C connects to B and opens a tunnel
 5. Sends `"hello punchgate!"` through the tunnel and verifies the echo
 
+## Observability
+
+Punchgate emits structured `tracing` events at every observation point — connections, pings, phase transitions, and tunnel lifecycle. Python scripts in `scripts/` parse these logs and produce aggregate reports.
+
+### Collecting Logs
+
+**Automated (recommended):** Run the E2E test — logs are saved to `logs/` automatically:
+
+```bash
+./scripts/e2e_tunnel_test.sh
+# Logs saved: logs/peer-a.log, logs/peer-b.log, logs/echo.log
+```
+
+**Manual:** Redirect stderr to a file (tracing writes to stderr):
+
+```bash
+cargo run -p cli -- \
+  --identity peer.key \
+  --listen /ip4/0.0.0.0/tcp/0 \
+  2> logs/my-peer.log
+```
+
+Use `RUST_LOG` to control verbosity:
+
+| Level                | What you get                                                      |
+| -------------------- | ----------------------------------------------------------------- |
+| `RUST_LOG=info`      | Connections, pings, phase transitions, tunnel events (default)    |
+| `RUST_LOG=cli=debug` | Adds per-event state machine processing (used by `log_phases.py`) |
+| `RUST_LOG=debug`     | Full libp2p internals (very verbose)                              |
+
+### Analysis Scripts
+
+All scripts auto-detect logs in `logs/`, accept an explicit file path, or read from stdin. Reports are automatically saved to `logs/` alongside the raw logs (e.g. `logs/summary.txt`, `logs/latency.csv`):
+
+```bash
+# Default: reads all *.log files from logs/, saves report to logs/summary.txt
+python scripts/log_summary.py
+
+# Explicit file
+python scripts/log_summary.py logs/peer-a.log
+
+# Pipe from a running node
+cargo run -p cli -- ... 2>&1 | python scripts/log_summary.py
+
+# Directory argument
+python scripts/log_summary.py logs/
+```
+
+Typical workflow after an E2E test:
+
+```bash
+./scripts/e2e_tunnel_test.sh        # populates logs/*.log
+python scripts/log_summary.py       # → logs/summary.txt
+python scripts/log_connections.py   # → logs/connections.txt
+python scripts/log_latency.py       # → logs/latency.txt
+python scripts/log_tunnels.py       # → logs/tunnels.txt
+python scripts/log_phases.py        # → logs/phases.txt
+```
+
+#### `log_summary.py` — Quick Overview
+
+One-page summary of a peer's activity: peer ID, listen addresses, phase progression, unique peers seen, ping stats, tunnel throughput, and warning/error counts.
+
+```
+============================================================
+PUNCHGATE PEER SUMMARY
+============================================================
+  Peer ID: 12D3KooW...
+  Log span: 10:30:00 - 10:35:42 (148 entries)
+
+  Phase progression:
+    10:30:01 Initializing -> Discovering (BootstrapConnected)
+    10:30:04 Discovering -> Participating (NatStatusChanged)
+
+  Unique peers seen: 3
+  Ping measurements: 42 (failures: 1)
+  RTT mean: 12.3ms
+  Tunnel sessions: 5 accepted, 0 rejected, 0 errors
+  Total bytes transferred: 1.2MB
+  Warnings: 1
+  Errors:   0
+```
+
+#### `log_connections.py` — Connection Topology
+
+Tracks peer connection/disconnection events. Shows peak connection count, churn rate, per-peer session durations, and a timeline of opens/closes. Useful for diagnosing connectivity instability.
+
+```bash
+python scripts/log_connections.py           # text table
+python scripts/log_connections.py --json    # machine-readable
+```
+
+#### `log_latency.py` — Ping RTT Analysis
+
+Per-peer RTT statistics (min, mean, median, p95, p99, max) and failure rates. Flags unhealthy peers (>10% failure rate or >500ms mean RTT).
+
+```bash
+python scripts/log_latency.py              # text table
+python scripts/log_latency.py --csv        # CSV for graphing
+```
+
+#### `log_tunnels.py` — Tunnel Throughput
+
+Aggregate and per-service tunnel metrics: accepted/rejected sessions, bytes transferred in each direction, error rates. Splits server-side and client-side views.
+
+```bash
+python scripts/log_tunnels.py              # text table
+python scripts/log_tunnels.py --json       # machine-readable
+```
+
+#### `log_phases.py` — State Machine Lifecycle
+
+Phase transition timeline, time spent in each phase, event frequency distribution, and anomaly detection (regressions like `Participating → Discovering`).
+
+```bash
+python scripts/log_phases.py               # text report
+python scripts/log_phases.py --json        # machine-readable
+```
+
+### Structured Events Reference
+
+| Event                    | Level | Key Fields                                                     | Source    |
+| ------------------------ | ----- | -------------------------------------------------------------- | --------- |
+| `connection opened`      | INFO  | `peer`, `endpoint`                                             | node.rs   |
+| `connection closed`      | INFO  | `peer`, `remaining`                                            | node.rs   |
+| `ping`                   | INFO  | `peer`, `rtt`                                                  | node.rs   |
+| `ping failed`            | WARN  | `peer`, `error`                                                | node.rs   |
+| `phase transition`       | INFO  | `event`, `from`, `to`, `commands`                              | node.rs   |
+| `event processed`        | DEBUG | `event`, `commands`                                            | node.rs   |
+| `tunnel request`         | INFO  | `peer_id`, `service`                                           | tunnel.rs |
+| `tunnel accepted`        | INFO  | `peer_id`, `service`, `local_addr`                             | tunnel.rs |
+| `tunnel rejected`        | WARN  | `peer_id`, `service`, `reason`                                 | tunnel.rs |
+| `tunnel closed`          | INFO  | `peer_id`, `service`, `bytes_to_service`, `bytes_from_service` | tunnel.rs |
+| `tunnel error`           | WARN  | `peer_id`, `error`                                             | tunnel.rs |
+| `client tunnel closed`   | INFO  | `service`, `bytes_to_remote`, `bytes_from_remote`              | tunnel.rs |
+| `client tunnel rejected` | WARN  | `service`, `reason`                                            | tunnel.rs |
+| `client tunnel error`    | WARN  | `service`, `error`                                             | tunnel.rs |
+
 ## Configuration
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--identity PATH` | `identity.key` | Persistent Ed25519 keypair file |
-| `--listen MULTIADDR` | `/ip4/0.0.0.0/tcp/0` | Address(es) to listen on |
-| `--bootstrap MULTIADDR` | *(none)* | Peer(s) to dial on startup |
-| `--expose NAME=HOST:PORT` | *(none)* | Expose a local TCP service to the mesh |
-| `--tunnel PEER:SVC@BIND` | *(none)* | Tunnel a remote service to a local port |
+| Flag                      | Default              | Description                             |
+| ------------------------- | -------------------- | --------------------------------------- |
+| `--identity PATH`         | `identity.key`       | Persistent Ed25519 keypair file         |
+| `--listen MULTIADDR`      | `/ip4/0.0.0.0/tcp/0` | Address(es) to listen on                |
+| `--bootstrap MULTIADDR`   | _(none)_             | Peer(s) to dial on startup              |
+| `--expose NAME=HOST:PORT` | _(none)_             | Expose a local TCP service to the mesh  |
+| `--tunnel PEER:SVC@BIND`  | _(none)_             | Tunnel a remote service to a local port |
 
 Environment: `PUNCHGATE_IDENTITY` overrides `--identity`. `RUST_LOG` controls log verbosity (default: `info`).
 

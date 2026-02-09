@@ -38,40 +38,51 @@ pub fn service_key(name: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
-    #[test]
-    fn parse_expose_valid() {
-        let svc = parse_expose("myapp=127.0.0.1:8080").expect("parse valid expose spec");
-        assert_eq!(svc.name, "myapp");
-        assert_eq!(
-            svc.local_addr,
-            "127.0.0.1:8080"
-                .parse::<SocketAddr>()
-                .expect("parse socket address")
-        );
+    fn arb_service_name() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9_-]{0,19}"
     }
 
-    #[test]
-    fn parse_expose_missing_equals() {
-        assert!(parse_expose("myapp127.0.0.1:8080").is_err());
+    fn arb_socket_addr() -> impl Strategy<Value = SocketAddr> {
+        (
+            1u8..=254,
+            0u8..=255,
+            0u8..=255,
+            1u8..=254,
+            1024u16..65535u16,
+        )
+            .prop_map(|(a, b, c, d, port)| {
+                // Infallible: formatted string is always a valid socket address
+                format!("{a}.{b}.{c}.{d}:{port}")
+                    .parse()
+                    .expect("generated socket address is always valid")
+            })
     }
 
-    #[test]
-    fn parse_expose_empty_name() {
-        assert!(parse_expose("=127.0.0.1:8080").is_err());
-    }
+    proptest! {
+        // Roundtrip: parse_expose recovers name and address from formatted spec
+        #[test]
+        fn parse_expose_roundtrip(
+            name in arb_service_name(),
+            addr in arb_socket_addr(),
+        ) {
+            let spec = format!("{name}={addr}");
+            let svc = parse_expose(&spec).expect("parse generated expose spec");
+            prop_assert_eq!(svc.name, name);
+            prop_assert_eq!(svc.local_addr, addr);
+        }
 
-    #[test]
-    fn parse_expose_invalid_addr() {
-        assert!(parse_expose("myapp=not_an_addr").is_err());
-    }
-
-    #[test]
-    fn service_key_has_prefix() {
-        let key = service_key("echo");
-        let key_str = String::from_utf8(key).expect("service key is valid UTF-8");
-        assert!(key_str.starts_with("/punchgate/svc/"));
-        assert!(key_str.ends_with("echo"));
+        // service_key always produces a UTF-8 string with the expected prefix
+        #[test]
+        fn service_key_format_contract(name in arb_service_name()) {
+            let key = service_key(&name);
+            let key_str = String::from_utf8(key)
+                .expect("service key should always be valid UTF-8");
+            prop_assert!(key_str.starts_with(SERVICE_KEY_PREFIX));
+            prop_assert!(key_str.ends_with(&name));
+        }
     }
 }

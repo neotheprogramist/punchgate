@@ -33,9 +33,12 @@ warn() { printf "${YELLOW}[warn]${RESET} %s\n" "$*"; }
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Temp directory for logs and keys ─────────────────────────────────────────
+# ── Temp directory for keys, logs/ for persistent output ─────────────────────
 
 TMPDIR="$(mktemp -d)"
+LOGS_DIR="$PROJECT_ROOT/logs"
+mkdir -p "$LOGS_DIR"
+
 ECHO_LOG="$TMPDIR/echo.log"
 PEER_B_LOG="$TMPDIR/peer-b.log"
 PEER_A_LOG="$TMPDIR/peer-a.log"
@@ -56,8 +59,17 @@ cleanup() {
         fi
     done
 
+    # Save ANSI-stripped logs to logs/ for analysis scripts
+    log "saving logs to $LOGS_DIR/"
+    for logfile in "$PEER_A_LOG" "$PEER_B_LOG" "$ECHO_LOG"; do
+        if [[ -f "$logfile" ]]; then
+            name="$(basename "$logfile")"
+            sed 's/\x1b\[[0-9;]*m//g' "$logfile" > "$LOGS_DIR/$name"
+        fi
+    done
+
     if [[ "${TEST_FAILED:-0}" == "1" ]]; then
-        warn "preserving logs in $TMPDIR"
+        warn "raw logs also preserved in $TMPDIR"
         echo "  echo server : $ECHO_LOG"
         echo "  peer B      : $PEER_B_LOG"
         echo "  peer A      : $PEER_A_LOG"
@@ -112,7 +124,7 @@ log "echo server ready (pid ${PIDS[-1]})"
 # ── Step 3: Start Peer B (exposes echo service) ─────────────────────────────
 
 log "starting peer B (expose echo=127.0.0.1:$ECHO_PORT)..."
-"$BINARY" \
+RUST_LOG="${RUST_LOG:-cli=debug}" "$BINARY" \
     --identity "$PEER_B_KEY" \
     --listen /ip4/127.0.0.1/tcp/0 \
     --expose "echo=127.0.0.1:$ECHO_PORT" \
@@ -142,7 +154,7 @@ BOOTSTRAP="$PEER_B_ADDR/p2p/$PEER_B_ID"
 TUNNEL_SPEC="$PEER_B_ID:echo@127.0.0.1:$TUNNEL_BIND_PORT"
 
 log "starting peer A (tunnel $TUNNEL_SPEC)..."
-"$BINARY" \
+RUST_LOG="${RUST_LOG:-cli=debug}" "$BINARY" \
     --identity "$PEER_A_KEY" \
     --listen /ip4/127.0.0.1/tcp/0 \
     --bootstrap "$BOOTSTRAP" \
@@ -187,4 +199,8 @@ else
 fi
 
 log "data path: nc → :$TUNNEL_BIND_PORT → Peer A → libp2p → Peer B → :$ECHO_PORT → echo → back"
-log "done."
+
+# Let pings and events accumulate briefly before shutdown
+sleep 2
+
+log "done. Analyze with: python scripts/log_summary.py"

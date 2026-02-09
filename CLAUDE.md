@@ -54,6 +54,10 @@ All variant handling must use exhaustive pattern matching. The compiler verifies
 
 Each state variant determines valid observations and transitions. The state type encodes what operations are valid. Invalid transitions should be unrepresentable in the type system where possible. Use exhaustive `match` on enums for runtime-validated transitions. Use typestate pattern (states as types) when invalid transitions must be compile errors—reserve for public APIs with serious misuse consequences.
 
+### Property-Based Testing
+
+Verify properties that hold for all valid inputs—not just specific examples: roundtrip invariants, algebraic laws, idempotence. Cover all state variants, success and error paths, boundary conditions.
+
 ### Collections Are Never Optional
 
 Never wrap collections in `Option`. Empty collection already represents absence—`Option<Vec<T>>` is redundant since `vec![]` conveys "no items."
@@ -65,6 +69,10 @@ Never wrap collections in `Option`. Empty collection already represents absence�
 | Single value that may be absent        | `Option<T>`             |
 
 This applies to all collection types: vectors, sets, maps, iterators.
+
+### No Hidden Runtime Failures
+
+Never use operators that can panic at runtime. All fallible operations must return `Result` or `Option` to make failure explicit in the type system.
 
 ### Code Style
 
