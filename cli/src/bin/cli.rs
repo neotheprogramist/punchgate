@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
+use anyhow::{Result, bail};
 use clap::Parser;
+use cli::state::NatStatus;
 use tracing_subscriber::EnvFilter;
 
 /// Punchgate — P2P NAT-traversing mesh node.
@@ -29,10 +31,23 @@ struct Cli {
     /// Tunnel to a remote service: peer_id:service_name@bind_addr
     #[arg(long)]
     tunnel: Vec<String>,
+
+    /// Override NAT status detection (private or public).
+    /// When set, bypasses AutoNAT wait and immediately enters participation.
+    #[arg(long)]
+    nat_status: Option<String>,
+}
+
+fn parse_nat_status(s: &str) -> Result<NatStatus> {
+    match s {
+        "private" => Ok(NatStatus::Private),
+        "public" => Ok(NatStatus::Public),
+        other => bail!("invalid --nat-status value '{other}': must be 'private' or 'public'"),
+    }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -41,12 +56,19 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    let nat_status = cli
+        .nat_status
+        .as_deref()
+        .map(parse_nat_status)
+        .transpose()?;
+
     cli::node::run(
         cli.identity,
         cli.listen,
         cli.bootstrap,
         cli.expose,
         cli.tunnel,
+        nat_status,
     )
     .await
 }

@@ -20,7 +20,7 @@ A peer-to-peer NAT-traversing tunnel mesh built on [libp2p](https://libp2p.io/).
 
 Events go in, a new state and a list of commands come out. Commands are data describing side effects (`Dial`, `KademliaBootstrap`, `PublishServices`, etc.) — they never touch the network directly. The event loop translates `SwarmEvent`s into `Event`s, feeds them to the state machine, then interprets the resulting `Command`s against the actual swarm.
 
-**Justification:** Separating "what to do" from "how to do it" makes the state machine fully testable without a network. All 15 state machine tests run in microseconds with no I/O. This also enables [bisimulation verification](https://en.wikipedia.org/wiki/Bisimulation) — proving that two different event orderings produce equivalent outcomes (e.g., Kademlia-then-AutoNAT vs AutoNAT-then-Kademlia both reach `Participating`).
+**Justification:** Separating "what to do" from "how to do it" makes the state machine fully testable without a network. All 18 state machine tests run in microseconds with no I/O. This also enables [bisimulation verification](https://en.wikipedia.org/wiki/Bisimulation) — proving that two different event orderings produce equivalent outcomes (e.g., Kademlia-then-AutoNAT vs AutoNAT-then-Kademlia both reach `Participating`).
 
 ### 3. State as Product of Orthogonal Coproducts
 
@@ -208,6 +208,46 @@ This test:
 4. C connects to B and opens a tunnel
 5. Sends `"hello punchgate!"` through the tunnel and verifies the echo
 
+### NAT Traversal: Tunnel Through a Relay
+
+The full NAT traversal flow connects a client to a service behind NAT via a public relay node, then upgrades to a direct connection via DCUtR hole punching. This requires three nodes on separate networks (or Docker containers / network namespaces).
+
+**Node 1 — Bootstrap (public IP, acts as relay):**
+
+```bash
+cargo run -p cli -- \
+  --listen /ip4/0.0.0.0/tcp/4001
+```
+
+**Node 2 — Workhorse (behind NAT, exposes SSH):**
+
+```bash
+cargo run -p cli -- \
+  --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
+  --nat-status private \
+  --expose ssh=127.0.0.1:22
+```
+
+The `--nat-status private` flag bypasses the AutoNAT wait, immediately triggering relay reservation. The workhorse connects to the bootstrap node, gets a relay circuit reservation, advertises the relay circuit address as an external address, and publishes services to the DHT.
+
+**Node 3 — Client (tunnel to workhorse's SSH):**
+
+```bash
+cargo run -p cli -- \
+  --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
+  --tunnel <WORKHORSE_ID>:ssh@127.0.0.1:2222
+```
+
+The client enters `Participating`, performs a Kademlia DHT lookup for the workhorse's peer ID, discovers the relay circuit address, dials through the relay, and DCUtR auto-triggers hole punching. On success, the tunnel spawns over the direct connection.
+
+**Verify:**
+
+```bash
+ssh -p 2222 user@127.0.0.1
+```
+
+The data path: `ssh → TCP:2222 → Client → [DCUtR direct or relay] → Workhorse → TCP:22 → sshd`.
+
 ## Observability
 
 Punchgate emits structured `tracing` events at every observation point — connections, pings, phase transitions, and tunnel lifecycle. Python scripts in `scripts/` parse these logs and produce aggregate reports.
@@ -329,32 +369,39 @@ python scripts/log_phases.py --json        # machine-readable
 
 ### Structured Events Reference
 
-| Event                    | Level | Key Fields                                                     | Source    |
-| ------------------------ | ----- | -------------------------------------------------------------- | --------- |
-| `connection opened`      | INFO  | `peer`, `endpoint`                                             | node.rs   |
-| `connection closed`      | INFO  | `peer`, `remaining`                                            | node.rs   |
-| `ping`                   | INFO  | `peer`, `rtt`                                                  | node.rs   |
-| `ping failed`            | WARN  | `peer`, `error`                                                | node.rs   |
-| `phase transition`       | INFO  | `event`, `from`, `to`, `commands`                              | node.rs   |
-| `event processed`        | DEBUG | `event`, `commands`                                            | node.rs   |
-| `tunnel request`         | INFO  | `peer_id`, `service`                                           | tunnel.rs |
-| `tunnel accepted`        | INFO  | `peer_id`, `service`, `local_addr`                             | tunnel.rs |
-| `tunnel rejected`        | WARN  | `peer_id`, `service`, `reason`                                 | tunnel.rs |
-| `tunnel closed`          | INFO  | `peer_id`, `service`, `bytes_to_service`, `bytes_from_service` | tunnel.rs |
-| `tunnel error`           | WARN  | `peer_id`, `error`                                             | tunnel.rs |
-| `client tunnel closed`   | INFO  | `service`, `bytes_to_remote`, `bytes_from_remote`              | tunnel.rs |
-| `client tunnel rejected` | WARN  | `service`, `reason`                                            | tunnel.rs |
-| `client tunnel error`    | WARN  | `service`, `error`                                             | tunnel.rs |
+| Event                                    | Level | Key Fields                                                     | Source    |
+| ---------------------------------------- | ----- | -------------------------------------------------------------- | --------- |
+| `connection opened`                      | INFO  | `peer`, `endpoint`                                             | node.rs   |
+| `connection closed`                      | INFO  | `peer`, `remaining`                                            | node.rs   |
+| `ping`                                   | INFO  | `peer`, `rtt`                                                  | node.rs   |
+| `ping failed`                            | WARN  | `peer`, `error`                                                | node.rs   |
+| `phase transition`                       | INFO  | `event`, `from`, `to`, `commands`                              | node.rs   |
+| `event processed`                        | DEBUG | `event`, `commands`                                            | node.rs   |
+| `starting DHT lookup for tunnel target`  | INFO  | `target_peer`                                                  | node.rs   |
+| `dialing tunnel target after DHT lookup` | INFO  | `target_peer`                                                  | node.rs   |
+| `connected to tunnel target via relay`   | INFO  | `peer_id`                                                      | node.rs   |
+| `hole punch succeeded, spawning tunnel`  | INFO  | `remote_peer`                                                  | node.rs   |
+| `hole punch failed — tunnel cannot...`   | ERROR | `remote_peer`, `reason`                                        | node.rs   |
+| `tunnel failed`                          | ERROR | `error`                                                        | node.rs   |
+| `tunnel request`                         | INFO  | `peer_id`, `service`                                           | tunnel.rs |
+| `tunnel accepted`                        | INFO  | `peer_id`, `service`, `local_addr`                             | tunnel.rs |
+| `tunnel rejected`                        | WARN  | `peer_id`, `service`, `reason`                                 | tunnel.rs |
+| `tunnel closed`                          | INFO  | `peer_id`, `service`, `bytes_to_service`, `bytes_from_service` | tunnel.rs |
+| `tunnel error`                           | WARN  | `peer_id`, `error`                                             | tunnel.rs |
+| `client tunnel closed`                   | INFO  | `service`, `bytes_to_remote`, `bytes_from_remote`              | tunnel.rs |
+| `client tunnel rejected`                 | WARN  | `service`, `reason`                                            | tunnel.rs |
+| `client tunnel error`                    | WARN  | `service`, `error`                                             | tunnel.rs |
 
 ## Configuration
 
-| Flag                      | Default              | Description                             |
-| ------------------------- | -------------------- | --------------------------------------- |
-| `--identity PATH`         | `identity.key`       | Persistent Ed25519 keypair file         |
-| `--listen MULTIADDR`      | `/ip4/0.0.0.0/tcp/0` | Address(es) to listen on                |
-| `--bootstrap MULTIADDR`   | _(none)_             | Peer(s) to dial on startup              |
-| `--expose NAME=HOST:PORT` | _(none)_             | Expose a local TCP service to the mesh  |
-| `--tunnel PEER:SVC@BIND`  | _(none)_             | Tunnel a remote service to a local port |
+| Flag                      | Default              | Description                                   |
+| ------------------------- | -------------------- | --------------------------------------------- |
+| `--identity PATH`         | `identity.key`       | Persistent Ed25519 keypair file               |
+| `--listen MULTIADDR`      | `/ip4/0.0.0.0/tcp/0` | Address(es) to listen on                      |
+| `--bootstrap MULTIADDR`   | _(none)_             | Peer(s) to dial on startup                    |
+| `--expose NAME=HOST:PORT` | _(none)_             | Expose a local TCP service to the mesh        |
+| `--tunnel PEER:SVC@BIND`  | _(none)_             | Tunnel a remote service to a local port       |
+| `--nat-status STATUS`     | _(none)_             | Override NAT detection: `private` or `public` |
 
 Environment: `PUNCHGATE_IDENTITY` overrides `--identity`. `RUST_LOG` controls log verbosity (default: `info`).
 

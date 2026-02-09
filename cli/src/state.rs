@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
 // ─── Command (output alphabet) ─────────────────────────────────────────────
 
@@ -159,6 +159,9 @@ impl PeerState {
         match event {
             Event::ListeningOn { addr } => {
                 commands.push(Command::Log(format!("listening on {addr}")));
+                if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                    commands.push(Command::AddExternalAddress(addr));
+                }
             }
 
             Event::BootstrapConnected { peer, addr } => {
@@ -287,6 +290,7 @@ impl PeerState {
 
             Event::RelayReservationAccepted { relay_peer } => {
                 self.relay = RelayState::Reserved { relay_peer };
+                commands.push(Command::PublishServices);
                 commands.push(Command::Log(format!(
                     "relay reservation accepted via {relay_peer}"
                 )));
@@ -414,6 +418,15 @@ mod tests {
             Just(NatStatus::Public),
             Just(NatStatus::Private),
         ]
+    }
+
+    fn arb_relay_circuit_multiaddr() -> impl Strategy<Value = Multiaddr> {
+        (arb_multiaddr(), arb_peer_id()).prop_map(|(base, relay_peer)| {
+            let mut addr = base;
+            addr.push(libp2p::multiaddr::Protocol::P2p(relay_peer));
+            addr.push(libp2p::multiaddr::Protocol::P2pCircuit);
+            addr
+        })
     }
 
     // ─── Properties ──────────────────────────────────────────────────────
@@ -736,9 +749,9 @@ mod tests {
             prop_assert_eq!(new_state.phase, Phase::Participating);
         }
 
-        // ListeningOn is a pure observation — no state change, only Log commands
+        // ListeningOn with a plain (non-circuit) addr emits only Log, no AddExternalAddress
         #[test]
-        fn listening_on_is_pure_log(
+        fn listening_on_plain_addr_no_external(
             phase in arb_phase(),
             addr in arb_multiaddr(),
         ) {
@@ -752,6 +765,34 @@ mod tests {
             prop_assert_eq!(new_state.relay, state_before.relay);
             prop_assert_eq!(new_state.known_peers, state_before.known_peers);
             prop_assert!(commands.iter().all(|c| matches!(c, Command::Log(_))));
+            prop_assert!(!commands.iter().any(|c| matches!(c, Command::AddExternalAddress(_))));
+        }
+
+        // ListeningOn with a P2pCircuit addr emits AddExternalAddress
+        #[test]
+        fn listening_on_circuit_addr_emits_add_external(
+            phase in arb_phase(),
+            addr in arb_relay_circuit_multiaddr(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = phase;
+
+            let (_, commands) = state.transition(Event::ListeningOn { addr: addr.clone() });
+            let has_add_external = commands.iter().any(|c| matches!(
+                c,
+                Command::AddExternalAddress(a) if *a == addr
+            ));
+            prop_assert!(has_add_external);
+        }
+
+        // RelayReservationAccepted emits PublishServices to refresh DHT
+        #[test]
+        fn relay_accepted_emits_publish_services(relay_peer in arb_peer_id()) {
+            let mut state = PeerState::new();
+            state.relay = RelayState::Requesting { relay_peer };
+
+            let (_, commands) = state.transition(Event::RelayReservationAccepted { relay_peer });
+            prop_assert!(commands.contains(&Command::PublishServices));
         }
     }
 }

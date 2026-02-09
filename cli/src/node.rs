@@ -62,6 +62,7 @@ pub async fn run(
     bootstrap_addrs: Vec<String>,
     expose_specs: Vec<String>,
     tunnel_specs: Vec<String>,
+    nat_status_override: Option<NatStatus>,
 ) -> Result<()> {
     let keypair = crate::identity::load_or_generate(&identity_path)?;
     let local_peer_id = PeerId::from(keypair.public());
@@ -124,21 +125,22 @@ pub async fn run(
         .map_err(|_| anyhow::anyhow!("tunnel protocol already registered"))?;
     tokio::spawn(tunnel::accept_loop(incoming, services.clone()));
 
-    // Parse and spawn tunnel connections (client side)
+    // Parse tunnel specs into deferred pending tunnels (spawned reactively after connection)
     let mut tunnel_registry = TunnelRegistry::new();
+    let mut pending_tunnels: HashMap<PeerId, Vec<(String, SocketAddr)>> = HashMap::new();
     for spec in &tunnel_specs {
         let (remote_peer, service_name, bind_addr) = tunnel::parse_tunnel_spec(spec)?;
-        let control = stream_control.clone();
-        let label = format!("{remote_peer}:{service_name}@{bind_addr}");
-        let handle = tokio::spawn(async move {
-            if let Err(e) =
-                tunnel::connect_tunnel(control, remote_peer, service_name, bind_addr).await
-            {
-                tracing::warn!(error = %e, "tunnel connect failed");
-            }
-        });
-        tunnel_registry.register(label, handle);
+        pending_tunnels
+            .entry(remote_peer)
+            .or_default()
+            .push((service_name, bind_addr));
     }
+
+    // Track in-flight Kademlia peer lookups for tunnel targets
+    let mut kad_tunnel_queries: HashMap<kad::QueryId, PeerId> = HashMap::new();
+
+    // Track peers we've dialed for tunnels but haven't established direct connection with
+    let mut tunnel_peers_dialing: HashSet<PeerId> = HashSet::new();
 
     // Listen on configured addresses
     for addr_str in &listen_addrs {
@@ -156,6 +158,26 @@ pub async fn run(
     let mut peer_state = PeerState::new();
     for peer_id in &bootstrap_peer_ids {
         peer_state.bootstrap_peers.insert(*peer_id);
+    }
+
+    // Apply NAT status override if provided (bypasses AutoNAT wait)
+    if let Some(status) = nat_status_override {
+        tracing::info!(?status, "applying --nat-status override");
+        let old_phase = peer_state.phase;
+        let (new_state, commands) = peer_state.transition(Event::NatStatusChanged(status));
+        if old_phase != new_state.phase {
+            tracing::info!(
+                from = phase_name(old_phase),
+                to = phase_name(new_state.phase),
+                "--nat-status triggered phase transition"
+            );
+        }
+        peer_state = new_state;
+        execute_commands(&mut swarm, &commands, &exposed);
+
+        if peer_state.phase == Phase::Participating {
+            initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
+        }
     }
 
     // Discovery timeout timer
@@ -209,10 +231,62 @@ pub async fn run(
                     );
                 }
 
+                // Handle Kademlia GetClosestPeers results for tunnel target lookups
+                if let SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::GetClosestPeers(..),
+                        step,
+                        ..
+                    }
+                )) = &event
+                    && step.last
+                    && let Some(target_peer) = kad_tunnel_queries.remove(id)
+                {
+                    match swarm.dial(target_peer) {
+                        Ok(()) => {
+                            tunnel_peers_dialing.insert(target_peer);
+                            tracing::info!(%target_peer, "dialing tunnel target after DHT lookup");
+                        }
+                        Err(e) => {
+                            tracing::error!(%target_peer, error = %e, "failed to dial tunnel target");
+                            pending_tunnels.remove(&target_peer);
+                        }
+                    }
+                }
+
+                // Handle ConnectionEstablished for tunnel targets
+                if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event
+                    && pending_tunnels.contains_key(peer_id)
+                {
+                    tunnel_peers_dialing.remove(peer_id);
+                    if is_relayed(endpoint) {
+                        tracing::info!(%peer_id, "connected to tunnel target via relay, waiting for DCUtR hole punch");
+                    } else if let Some(specs) = pending_tunnels.remove(peer_id) {
+                        spawn_tunnels(&specs, *peer_id, &stream_control, &mut tunnel_registry);
+                    }
+                }
+
                 if let Some(state_event) = translate_swarm_event(
                     &event,
                     &bootstrap_peer_ids,
                 ) {
+                    // Check for tunnel-relevant hole punch results before state transition
+                    match &state_event {
+                        Event::HolePunchSucceeded { remote_peer } => {
+                            if let Some(specs) = pending_tunnels.remove(remote_peer) {
+                                tracing::info!(%remote_peer, "hole punch succeeded, spawning tunnel");
+                                spawn_tunnels(&specs, *remote_peer, &stream_control, &mut tunnel_registry);
+                            }
+                        }
+                        Event::HolePunchFailed { remote_peer, reason } => {
+                            if pending_tunnels.remove(remote_peer).is_some() {
+                                tracing::error!(%remote_peer, %reason, "hole punch failed — tunnel cannot be established (direct connection required)");
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let old_phase = peer_state.phase;
                     let event_label = event_name(&state_event);
                     let (new_state, commands) = peer_state.transition(state_event);
@@ -232,6 +306,12 @@ pub async fn run(
                         &commands,
                         &exposed,
                     );
+
+                    // Initiate DHT lookups when transitioning to Participating
+                    if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
+                        initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
+                    }
+
                     if peer_state.phase == Phase::ShuttingDown {
                         tracing::info!("shutting down");
                         break;
@@ -254,6 +334,10 @@ pub async fn run(
                 }
                 peer_state = new_state;
                 execute_commands(&mut swarm, &commands, &exposed);
+
+                if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
+                    initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
+                }
             }
             _ = republish_interval.tick(), if peer_state.phase == Phase::Participating => {
                 publish_services(&mut swarm, &exposed);
@@ -541,6 +625,50 @@ fn publish_services(swarm: &mut libp2p::Swarm<Behaviour>, exposed: &[ExposedServ
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    let addr = match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+    };
+    addr.iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+fn spawn_tunnels(
+    specs: &[(String, SocketAddr)],
+    remote_peer: PeerId,
+    stream_control: &libp2p_stream::Control,
+    registry: &mut TunnelRegistry,
+) {
+    for (service_name, bind_addr) in specs {
+        let control = stream_control.clone();
+        let svc = service_name.clone();
+        let addr = *bind_addr;
+        let label = format!("{remote_peer}:{svc}@{addr}");
+        let handle = tokio::spawn(async move {
+            if let Err(e) = tunnel::connect_tunnel(control, remote_peer, svc, addr).await {
+                tracing::error!(error = %e, "tunnel failed");
+            }
+        });
+        registry.register(label, handle);
+    }
+}
+
+fn initiate_tunnel_lookups(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    pending_tunnels: &HashMap<PeerId, Vec<(String, SocketAddr)>>,
+    kad_tunnel_queries: &mut HashMap<kad::QueryId, PeerId>,
+) {
+    for &target_peer in pending_tunnels.keys() {
+        let query_id = swarm
+            .behaviour_mut()
+            .kademlia
+            .get_closest_peers(target_peer);
+        kad_tunnel_queries.insert(query_id, target_peer);
+        tracing::info!(%target_peer, "starting DHT lookup for tunnel target");
+    }
+}
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     addr.iter().find_map(|proto| {

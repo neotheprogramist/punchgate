@@ -5,6 +5,42 @@
 # Starts an echo server, two peers (B exposes it, A tunnels to it),
 # sends a message through the tunnel, and verifies the echo.
 #
+# This test exercises the DIRECT LAN scenario (mDNS discovery, no NAT).
+#
+# ── NAT Traversal Scenario (manual test) ──────────────────────────────────────
+#
+# The full NAT traversal flow requires real network separation (separate
+# subnets, Docker containers, or different machines). It cannot be tested
+# on localhost because both peers share the same network, so there is no
+# actual NAT to punch through.
+#
+# 3-node setup:
+#   Terminal 1 (bootstrap, public IP):
+#     ./punchgate --listen /ip4/0.0.0.0/tcp/4001
+#
+#   Terminal 2 (workhorse, behind NAT):
+#     ./punchgate \
+#       --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
+#       --nat-status private \
+#       --expose ssh=127.0.0.1:22
+#
+#   Terminal 3 (client, behind NAT or public):
+#     ./punchgate \
+#       --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
+#       --tunnel <WORKHORSE_ID>:ssh@127.0.0.1:2222
+#
+# Flow:
+#   1. Workhorse connects to bootstrap → gets relay reservation → advertises
+#      relay circuit address as external address → publishes services to DHT
+#   2. Client enters Participating → Kademlia lookup for workhorse peer ID →
+#      discovers workhorse's relay circuit address → dials via relay
+#   3. DCUtR auto-triggers hole punch over relay circuit
+#   4. On hole punch success → client spawns tunnel task → SSH works via
+#      direct connection at 127.0.0.1:2222
+#
+# Verify: ssh -p 2222 user@127.0.0.1
+# ──────────────────────────────────────────────────────────────────────────────
+#
 set -euo pipefail
 
 # ── Configurable knobs ───────────────────────────────────────────────────────
