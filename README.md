@@ -73,37 +73,40 @@ cli/src/
 ├── protocol.rs      # Protocol IDs and constants
 ├── identity.rs      # Ed25519 keypair persistence
 ├── state.rs         # Pure coalgebraic state machine
-├── behaviour.rs     # Unified NetworkBehaviour (9 sub-behaviours)
+├── behaviour.rs     # Unified NetworkBehaviour (8–9 sub-behaviours)
 ├── node.rs          # Swarm event loop (translate → transition → execute)
 ├── service.rs       # Service advertisement via Kademlia DHT
 └── tunnel.rs        # Tunnel lifecycle (accept, connect, registry)
 
 scripts/
-├── echo_server.py      # TCP echo server for testing
-├── e2e_tunnel_test.sh  # Automated E2E test (saves logs to logs/)
-├── log_parse.py        # Shared structured log parser
-├── log_summary.py      # Quick one-page peer overview
-├── log_connections.py   # Connection topology analysis
-├── log_latency.py      # Ping RTT statistics
-├── log_tunnels.py      # Tunnel throughput metrics
-└── log_phases.py       # State machine lifecycle analysis
+├── echo_server.py         # TCP echo server for testing
+├── e2e_tunnel_test.sh     # Automated E2E test — direct LAN (saves logs to logs/)
+├── e2e_compose_test.sh    # Automated E2E test — NAT traversal via containers
+├── log_parse.py           # Shared structured log parser
+├── log_summary.py         # Quick one-page peer overview
+├── log_connections.py     # Connection topology analysis
+├── log_latency.py         # Ping RTT statistics
+├── log_tunnels.py         # Tunnel throughput metrics
+└── log_phases.py          # State machine lifecycle analysis
 
-logs/                   # Peer logs (auto-populated by e2e test, gitignored)
+Containerfile              # Multi-stage build (cargo-chef + sccache)
+compose.yaml               # 4-service topology for NAT traversal E2E test
+logs/                      # Peer logs (auto-populated by e2e test, gitignored)
 ```
 
-The nine sub-behaviours composed into a single `NetworkBehaviour`:
+The sub-behaviours composed into a single `NetworkBehaviour` (mDNS is compile-time optional via the `mdns` feature flag):
 
-| Behaviour          | Purpose                                                 |
-| ------------------ | ------------------------------------------------------- |
-| **Kademlia**       | Distributed hash table for peer and service discovery   |
-| **mDNS**           | Zero-config LAN peer discovery                          |
-| **Identify**       | Exchange peer metadata on connection                    |
-| **AutoNAT**        | Determine NAT reachability status                       |
-| **Relay (server)** | Act as relay for other NAT'd peers                      |
-| **Relay (client)** | Use relays when behind NAT                              |
-| **DCUtR**          | Direct Connection Upgrade through Relay (hole punching) |
-| **Ping**           | Keepalive and latency measurement                       |
-| **Stream**         | Custom protocol streams for tunneling                   |
+| Behaviour          | Purpose                                                           |
+| ------------------ | ----------------------------------------------------------------- |
+| **Kademlia**       | Distributed hash table for peer and service discovery             |
+| **mDNS** _(opt)_   | Zero-config LAN peer discovery (`--features mdns`, on by default) |
+| **Identify**       | Exchange peer metadata on connection                              |
+| **AutoNAT**        | Determine NAT reachability status                                 |
+| **Relay (server)** | Act as relay for other NAT'd peers                                |
+| **Relay (client)** | Use relays when behind NAT                                        |
+| **DCUtR**          | Direct Connection Upgrade through Relay (hole punching)           |
+| **Ping**           | Keepalive and latency measurement                                 |
+| **Stream**         | Custom protocol streams for tunneling                             |
 
 ## Quick Start
 
@@ -115,7 +118,11 @@ The nine sub-behaviours composed into a single `NetworkBehaviour`:
 ### Build
 
 ```bash
+# Default build (includes mDNS for LAN discovery)
 cargo build
+
+# Without mDNS (forces DHT-only discovery — used in container E2E tests)
+cargo build --no-default-features
 ```
 
 ### Run the Tests
@@ -247,6 +254,37 @@ ssh -p 2222 user@127.0.0.1
 ```
 
 The data path: `ssh → TCP:2222 → Client → [DCUtR direct or relay] → Workhorse → TCP:22 → sshd`.
+
+### Container E2E Test: NAT Traversal via Compose
+
+The full relay → DCUtR → tunnel flow can be tested locally using containers. The image is built with `--no-default-features` (mDNS disabled), forcing all discovery through the Kademlia DHT — same as a real multi-network deployment.
+
+Requires `podman compose`.
+
+```bash
+./scripts/e2e_compose_test.sh
+```
+
+The script orchestrates four containers on a single bridge network (`172.28.0.0/24`):
+
+| Container     | IP          | Role                                              |
+| ------------- | ----------- | ------------------------------------------------- |
+| **echo**      | 172.28.0.20 | TCP echo server (python:3-alpine)                 |
+| **bootstrap** | 172.28.0.10 | Public relay node                                 |
+| **workhorse** | 172.28.0.30 | NAT'd peer (`--nat-status private`), exposes echo |
+| **client**    | 172.28.0.40 | Tunnels to workhorse's echo, port 2222 on host    |
+
+Startup is phased: bootstrap starts first (peer ID parsed from logs), then workhorse (connects to bootstrap, gets relay reservation), then client (DHT lookup → relay dial → DCUtR → tunnel). The test sends a payload through `nc → 127.0.0.1:2222` and verifies the echo.
+
+To build the image separately:
+
+```bash
+# E2E test image (no mDNS — default)
+podman build -t punchgate:local .
+
+# Production image (mDNS enabled)
+podman build -t punchgate:local --build-arg FEATURES="" .
+```
 
 ## Observability
 
