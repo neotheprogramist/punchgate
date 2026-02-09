@@ -361,6 +361,21 @@ impl PeerState {
             commands.push(Command::Log(
                 "discovery complete, entering participation".into(),
             ));
+
+            if self.nat_status == NatStatus::Private
+                && self.relay == RelayState::Idle
+                && let Some((&relay_peer, addrs)) = self
+                    .known_peers
+                    .iter()
+                    .find(|(p, _)| self.bootstrap_peers.contains(p))
+                && let Some(addr) = addrs.iter().next()
+            {
+                self.relay = RelayState::Requesting { relay_peer };
+                commands.push(Command::RequestRelayReservation {
+                    relay_peer,
+                    relay_addr: addr.clone(),
+                });
+            }
         }
         (self, commands)
     }
@@ -519,11 +534,12 @@ mod tests {
             let (state_b, _) = state_b.transition(Event::NatStatusChanged(nat_status));
             let (state_b, _) = state_b.transition(Event::KademliaBootstrapOk);
 
-            // Both paths must reach Participating with identical discovery flags
+            // Both paths must reach Participating with identical state
             prop_assert_eq!(state_a.phase, Phase::Participating);
             prop_assert_eq!(state_b.phase, Phase::Participating);
             prop_assert_eq!(state_a.kad_bootstrapped, state_b.kad_bootstrapped);
             prop_assert_eq!(state_a.autonat_resolved, state_b.autonat_resolved);
+            prop_assert_eq!(state_a.relay, state_b.relay);
         }
 
         // DiscoveryTimeout from Discovering forces Participating
@@ -639,6 +655,33 @@ mod tests {
                 c,
                 Command::RequestRelayReservation { relay_peer, .. }
                 if *relay_peer == bootstrap_peer
+            ));
+            prop_assert!(has_relay_cmd);
+        }
+
+        // Early --nat-status private (before bootstrap) still triggers relay on Participating
+        #[test]
+        fn early_private_nat_triggers_relay_on_participating(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let state = PeerState::new();
+            // NAT override fires in Initializing — no bootstrap peer yet
+            let (state, _) = state.transition(Event::NatStatusChanged(NatStatus::Private));
+            prop_assert!(matches!(state.relay, RelayState::Idle));
+
+            // Bootstrap connects, enter Discovering
+            let (state, _) = state.transition(Event::BootstrapConnected { peer, addr });
+            prop_assert_eq!(state.phase, Phase::Discovering);
+
+            // Kademlia completes → enter Participating → relay reservation fires
+            let (state, commands) = state.transition(Event::KademliaBootstrapOk);
+            prop_assert_eq!(state.phase, Phase::Participating);
+            prop_assert_eq!(state.relay, RelayState::Requesting { relay_peer: peer });
+            let has_relay_cmd = commands.iter().any(|c| matches!(
+                c,
+                Command::RequestRelayReservation { relay_peer, .. }
+                if *relay_peer == peer
             ));
             prop_assert!(has_relay_cmd);
         }

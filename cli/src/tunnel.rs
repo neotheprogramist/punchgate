@@ -98,7 +98,6 @@ async fn handle_tunnel(
         return Ok(());
     };
 
-    // Connect to the local service
     let tcp_stream = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("connecting to local service at {local_addr}"))?;
@@ -186,7 +185,6 @@ async fn client_tunnel_session(
     mut tcp_stream: TcpStream,
     service_name: &str,
 ) -> Result<()> {
-    // Send request
     write_message(
         stream,
         &TunnelRequest {
@@ -195,7 +193,6 @@ async fn client_tunnel_session(
     )
     .await?;
 
-    // Read response
     let response: TunnelResponse = read_message(stream).await?;
 
     if !response.accepted {
@@ -204,7 +201,6 @@ async fn client_tunnel_session(
         bail!("tunnel rejected: {reason}");
     }
 
-    // Bridge
     let mut compat_stream = stream.compat();
     match copy_bidirectional(&mut compat_stream, &mut tcp_stream).await {
         Ok((bytes_to_remote, bytes_from_remote)) => {
@@ -244,7 +240,6 @@ pub fn parse_tunnel_spec(spec: &str) -> Result<(PeerId, String, SocketAddr)> {
 
 // ─── Tunnel registry ────────────────────────────────────────────────────────
 
-/// Tracks active tunnel tasks for graceful shutdown.
 pub struct TunnelRegistry {
     tunnels: HashMap<u64, (String, JoinHandle<()>)>,
     next_id: u64,
@@ -264,7 +259,6 @@ impl TunnelRegistry {
         }
     }
 
-    /// Register a tunnel task. Returns its ID.
     pub fn register(&mut self, label: String, handle: JoinHandle<()>) -> u64 {
         let id = self.next_id;
         // Infallible: u64 overflow requires 2^64 registrations, physically impossible
@@ -276,7 +270,6 @@ impl TunnelRegistry {
         id
     }
 
-    /// Remove a completed tunnel.
     pub fn unregister(&mut self, id: u64) {
         self.tunnels.remove(&id);
     }

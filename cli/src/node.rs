@@ -8,9 +8,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+#[cfg(feature = "mdns")]
+use libp2p::mdns;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, autonat, identify, kad, mdns, noise, ping, relay,
-    swarm::SwarmEvent, yamux,
+    Multiaddr, PeerId, SwarmBuilder, autonat, identify, kad, noise, ping, relay, swarm::SwarmEvent,
+    yamux,
 };
 
 use crate::{
@@ -63,31 +65,29 @@ pub async fn run(
     expose_specs: Vec<String>,
     tunnel_specs: Vec<String>,
     nat_status_override: Option<NatStatus>,
+    external_addrs: Vec<String>,
 ) -> Result<()> {
     let keypair = crate::identity::load_or_generate(&identity_path)?;
     let local_peer_id = PeerId::from(keypair.public());
     tracing::info!(%local_peer_id, "starting punchgate node");
 
-    // Parse exposed services
     let exposed: Vec<ExposedService> = expose_specs
         .iter()
         .map(|s| service::parse_expose(s))
         .collect::<Result<_>>()?;
 
-    let services: Arc<std::collections::HashMap<String, SocketAddr>> = Arc::new(
+    let services: Arc<HashMap<String, SocketAddr>> = Arc::new(
         exposed
             .iter()
             .map(|s| (s.name.clone(), s.local_addr))
             .collect(),
     );
 
-    // Parse bootstrap multiaddrs
     let bootstrap_multiaddrs: Vec<Multiaddr> = bootstrap_addrs
         .iter()
         .map(|s| s.parse().context("invalid bootstrap multiaddr"))
         .collect::<Result<_>>()?;
 
-    // Extract bootstrap peer IDs with their addresses
     let bootstrap_peers_with_addrs: Vec<(PeerId, Multiaddr)> = bootstrap_multiaddrs
         .iter()
         .filter_map(|addr| extract_peer_id(addr).map(|pid| (pid, addr.clone())))
@@ -98,7 +98,6 @@ pub async fn run(
         .map(|(pid, _)| *pid)
         .collect();
 
-    // Build the swarm
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -116,10 +115,7 @@ pub async fn run(
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
 
-    // Get stream control for tunnels
     let mut stream_control = swarm.behaviour().stream.new_control();
-
-    // Start tunnel accept loop
     let incoming = stream_control
         .accept(protocol::tunnel_protocol())
         .map_err(|_| anyhow::anyhow!("tunnel protocol already registered"))?;
@@ -136,25 +132,26 @@ pub async fn run(
             .push((service_name, bind_addr));
     }
 
-    // Track in-flight Kademlia peer lookups for tunnel targets
     let mut kad_tunnel_queries: HashMap<kad::QueryId, PeerId> = HashMap::new();
-
-    // Track peers we've dialed for tunnels but haven't established direct connection with
     let mut tunnel_peers_dialing: HashSet<PeerId> = HashSet::new();
 
-    // Listen on configured addresses
+    // Register external addresses (needed for relay server to include in reservations)
+    for addr_str in &external_addrs {
+        let addr: Multiaddr = addr_str.parse().context("invalid external address")?;
+        tracing::info!(%addr, "adding external address");
+        swarm.add_external_address(addr);
+    }
+
     for addr_str in &listen_addrs {
         let addr: Multiaddr = addr_str.parse().context("invalid listen multiaddr")?;
         swarm.listen_on(addr)?;
     }
 
-    // Dial bootstrap peers
     for addr in &bootstrap_multiaddrs {
         tracing::info!(%addr, "dialing bootstrap peer");
         swarm.dial(addr.clone())?;
     }
 
-    // Initialize state machine
     let mut peer_state = PeerState::new();
     for peer_id in &bootstrap_peer_ids {
         peer_state.bootstrap_peers.insert(*peer_id);
@@ -180,23 +177,17 @@ pub async fn run(
         }
     }
 
-    // Discovery timeout timer
     let discovery_deadline = tokio::time::sleep(DISCOVERY_TIMEOUT);
     tokio::pin!(discovery_deadline);
     let mut discovery_timeout_fired = false;
 
-    // Service republish timer
     let mut republish_interval = tokio::time::interval(protocol::SERVICE_REPUBLISH_INTERVAL);
     republish_interval.tick().await; // skip first immediate tick
 
-    // Reconnection backoff for bootstrap peers
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
-
-    // Pending reconnections (peer → when to reconnect)
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
     loop {
-        // Find the earliest reconnect deadline
         let next_reconnect = pending_reconnects.values().min().copied();
 
         tokio::select! {
@@ -271,20 +262,15 @@ pub async fn run(
                     &event,
                     &bootstrap_peer_ids,
                 ) {
-                    // Check for tunnel-relevant hole punch results before state transition
-                    match &state_event {
-                        Event::HolePunchSucceeded { remote_peer } => {
-                            if let Some(specs) = pending_tunnels.remove(remote_peer) {
-                                tracing::info!(%remote_peer, "hole punch succeeded, spawning tunnel");
-                                spawn_tunnels(&specs, *remote_peer, &stream_control, &mut tunnel_registry);
-                            }
+                    if let Event::HolePunchSucceeded { remote_peer } = &state_event {
+                        if let Some(specs) = pending_tunnels.remove(remote_peer) {
+                            tracing::info!(%remote_peer, "hole punch succeeded, spawning tunnel");
+                            spawn_tunnels(&specs, *remote_peer, &stream_control, &mut tunnel_registry);
                         }
-                        Event::HolePunchFailed { remote_peer, reason } => {
-                            if pending_tunnels.remove(remote_peer).is_some() {
-                                tracing::error!(%remote_peer, %reason, "hole punch failed — tunnel cannot be established (direct connection required)");
-                            }
-                        }
-                        _ => {}
+                    } else if let Event::HolePunchFailed { remote_peer, reason } = &state_event
+                        && pending_tunnels.remove(remote_peer).is_some()
+                    {
+                        tracing::error!(%remote_peer, %reason, "hole punch failed — tunnel cannot be established (direct connection required)");
                     }
 
                     let old_phase = peer_state.phase;
@@ -398,7 +384,6 @@ pub async fn run(
         }
     }
 
-    // Graceful tunnel shutdown
     tunnel_registry.shutdown_all(Duration::from_secs(5)).await;
 
     Ok(())
@@ -439,12 +424,22 @@ fn translate_swarm_event(
 
         SwarmEvent::Behaviour(behaviour_event) => translate_behaviour_event(behaviour_event),
 
+        SwarmEvent::ListenerError { error, .. } => {
+            tracing::warn!(error = %error, "listener error");
+            None
+        }
+        SwarmEvent::ListenerClosed { reason, .. } => {
+            tracing::info!(reason = ?reason, "listener closed");
+            None
+        }
+        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+            tracing::warn!(peer = ?peer_id, error = %error, "outgoing connection error");
+            None
+        }
+
         SwarmEvent::IncomingConnection { .. }
         | SwarmEvent::IncomingConnectionError { .. }
-        | SwarmEvent::OutgoingConnectionError { .. }
         | SwarmEvent::ExpiredListenAddr { .. }
-        | SwarmEvent::ListenerClosed { .. }
-        | SwarmEvent::ListenerError { .. }
         | SwarmEvent::Dialing { .. }
         | SwarmEvent::NewExternalAddrCandidate { .. }
         | SwarmEvent::ExternalAddrConfirmed { .. }
@@ -470,9 +465,11 @@ fn translate_behaviour_event(event: &BehaviourEvent) -> Option<Event> {
         // kad::Event is #[non_exhaustive] — wildcard covers other query types
         BehaviourEvent::Kademlia(_) => None,
 
+        #[cfg(feature = "mdns")]
         BehaviourEvent::Mdns(mdns::Event::Discovered(list)) => Some(Event::MdnsDiscovered {
             peers: list.clone(),
         }),
+        #[cfg(feature = "mdns")]
         BehaviourEvent::Mdns(mdns::Event::Expired(list)) => Some(Event::MdnsExpired {
             peers: list.clone(),
         }),
@@ -503,8 +500,10 @@ fn translate_behaviour_event(event: &BehaviourEvent) -> Option<Event> {
         }) => Some(Event::RelayReservationAccepted {
             relay_peer: *relay_peer_id,
         }),
-        // relay::client::Event is #[non_exhaustive]
-        BehaviourEvent::RelayClient(_) => None,
+        BehaviourEvent::RelayClient(event) => {
+            tracing::debug!(?event, "relay client event");
+            None
+        }
 
         BehaviourEvent::Dcutr(event) => match &event.result {
             Ok(_) => Some(Event::HolePunchSucceeded {
@@ -574,11 +573,21 @@ fn execute_commands(
                     tracing::warn!(error = %e, "put_record failed");
                 }
             }
-            Command::RequestRelayReservation { relay_addr, .. } => {
-                let relay_circuit_addr = relay_addr
-                    .clone()
-                    .with(libp2p::multiaddr::Protocol::P2pCircuit);
-                if let Err(e) = swarm.listen_on(relay_circuit_addr) {
+            Command::RequestRelayReservation {
+                relay_peer,
+                relay_addr,
+            } => {
+                let mut base = relay_addr
+                    .iter()
+                    .take_while(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                    .fold(Multiaddr::empty(), |mut acc, p| {
+                        acc.push(p);
+                        acc
+                    });
+                base.push(libp2p::multiaddr::Protocol::P2p(*relay_peer));
+                base.push(libp2p::multiaddr::Protocol::P2pCircuit);
+                tracing::info!(%base, "requesting relay reservation");
+                if let Err(e) = swarm.listen_on(base) {
                     tracing::warn!(error = %e, "relay reservation listen failed");
                 }
             }

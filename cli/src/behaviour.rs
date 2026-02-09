@@ -1,7 +1,8 @@
 use anyhow::Result;
+#[cfg(feature = "mdns")]
+use libp2p::mdns;
 use libp2p::{
-    PeerId, autonat, dcutr, identify, identity::Keypair, kad, mdns, ping, relay,
-    swarm::NetworkBehaviour,
+    PeerId, autonat, dcutr, identify, identity::Keypair, kad, ping, relay, swarm::NetworkBehaviour,
 };
 
 use crate::protocol;
@@ -9,6 +10,7 @@ use crate::protocol;
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    #[cfg(feature = "mdns")]
     pub mdns: mdns::tokio::Behaviour,
     pub relay_server: relay::Behaviour,
     pub relay_client: relay::client::Behaviour,
@@ -27,6 +29,7 @@ impl Behaviour {
         let store = kad::store::MemoryStore::new(peer_id);
         let kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
 
+        #[cfg(feature = "mdns")]
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
         let relay_server = relay::Behaviour::new(peer_id, Default::default());
@@ -40,6 +43,7 @@ impl Behaviour {
 
         Ok(Self {
             kademlia,
+            #[cfg(feature = "mdns")]
             mdns,
             relay_server,
             relay_client,

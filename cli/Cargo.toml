@@ -3,6 +3,10 @@ name = "cli"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["mdns"]
+mdns = ["libp2p/mdns"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

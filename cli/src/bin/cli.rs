@@ -36,6 +36,11 @@ struct Cli {
     /// When set, bypasses AutoNAT wait and immediately enters participation.
     #[arg(long)]
     nat_status: Option<String>,
+
+    /// Declare external address(es) for this node.
+    /// Required for relay servers so clients learn how to reach the relay.
+    #[arg(long)]
+    external_address: Vec<String>,
 }
 
 fn parse_nat_status(s: &str) -> Result<NatStatus> {
@@ -69,6 +74,7 @@ async fn main() -> Result<()> {
         cli.expose,
         cli.tunnel,
         nat_status,
+        cli.external_address,
     )
     .await
 }

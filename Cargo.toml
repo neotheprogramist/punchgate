@@ -17,7 +17,6 @@ libp2p = { version = "0.56.0", features = [
     "identify",
     "kad",
     "macros",
-    "mdns",
     "noise",
     "ping",
     "quic",

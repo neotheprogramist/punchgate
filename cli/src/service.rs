@@ -4,7 +4,6 @@ use anyhow::{Context, Result, bail};
 
 use crate::protocol::SERVICE_KEY_PREFIX;
 
-/// A local service exposed to the mesh.
 #[derive(Debug, Clone)]
 pub struct ExposedService {
     pub name: String,
@@ -31,7 +30,6 @@ pub fn parse_expose(spec: &str) -> Result<ExposedService> {
     })
 }
 
-/// Build a DHT key for a service name.
 pub fn service_key(name: &str) -> Vec<u8> {
     format!("{SERVICE_KEY_PREFIX}{name}").into_bytes()
 }

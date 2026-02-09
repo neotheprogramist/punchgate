@@ -1,7 +1,9 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::StreamExt;
-use libp2p::{PeerId, SwarmBuilder, identify, kad, mdns, noise, swarm::SwarmEvent, yamux};
+#[cfg(feature = "mdns")]
+use libp2p::mdns;
+use libp2p::{PeerId, SwarmBuilder, identify, kad, noise, swarm::SwarmEvent, yamux};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -29,6 +31,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
             let store = kad::store::MemoryStore::new(peer_id);
             let kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
 
+            #[cfg(feature = "mdns")]
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
                 .expect("create mDNS behaviour");
 
@@ -41,6 +44,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
 
             TestBehaviour {
                 kademlia,
+                #[cfg(feature = "mdns")]
                 mdns,
                 identify,
                 stream,
@@ -65,6 +69,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct TestBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    #[cfg(feature = "mdns")]
     mdns: mdns::tokio::Behaviour,
     identify: identify::Behaviour,
     stream: libp2p_stream::Behaviour,
@@ -72,6 +77,7 @@ struct TestBehaviour {
 
 // ─── Test 1: Two-peer mDNS discovery ────────────────────────────────────────
 
+#[cfg(feature = "mdns")]
 #[tokio::test]
 async fn two_peer_mdns_discovery() {
     let (mut swarm_a, _peer_a, _) = build_test_swarm();
