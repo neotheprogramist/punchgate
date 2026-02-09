@@ -1,0 +1,63 @@
+networks:
+  punchnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+services:
+  echo:
+    image: python:3-alpine
+    networks:
+      punchnet:
+        ipv4_address: 172.28.0.20
+    volumes:
+      - ./scripts/echo_server.py:/echo_server.py:ro
+    command: python3 /echo_server.py --host 0.0.0.0 --port 7777
+
+  bootstrap:
+    build: .
+    image: punchgate:local
+    networks:
+      punchnet:
+        ipv4_address: 172.28.0.10
+    command:
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "--external-address"
+      - "/ip4/172.28.0.10/tcp/4001"
+
+  workhorse:
+    image: punchgate:local
+    depends_on:
+      - echo
+      - bootstrap
+    networks:
+      punchnet:
+        ipv4_address: 172.28.0.30
+    command:
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "--bootstrap"
+      - "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
+      - "--nat-status"
+      - "private"
+      - "--expose"
+      - "echo=172.28.0.20:7777"
+
+  client:
+    image: punchgate:local
+    depends_on:
+      - workhorse
+    networks:
+      punchnet:
+        ipv4_address: 172.28.0.40
+    ports:
+      - "2222:2222"
+    command:
+      - "--listen"
+      - "/ip4/0.0.0.0/tcp/4001"
+      - "--bootstrap"
+      - "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
+      - "--tunnel"
+      - "${WORKHORSE_ID}:echo@0.0.0.0:2222"
