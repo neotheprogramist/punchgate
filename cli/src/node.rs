@@ -46,7 +46,7 @@ impl ReconnectBackoff {
         let delay = self.delays.entry(peer).or_insert(BACKOFF_INITIAL);
         let current = *delay;
         // Double for next time, capped at max
-        *delay = delay.checked_mul(2).unwrap_or(BACKOFF_MAX).min(BACKOFF_MAX);
+        *delay = delay.checked_mul(2).unwrap_or(BACKOFF_MAX);
         Some((addr.clone(), current))
     }
 
@@ -57,21 +57,25 @@ impl ReconnectBackoff {
 
 // ─── Main entry ─────────────────────────────────────────────────────────────
 
+pub struct NodeConfig {
+    pub identity_path: PathBuf,
+    pub listen_addrs: Vec<String>,
+    pub bootstrap_addrs: Vec<String>,
+    pub expose_specs: Vec<String>,
+    pub tunnel_specs: Vec<String>,
+    pub tunnel_by_name_specs: Vec<String>,
+    pub nat_status_override: Option<NatStatus>,
+    pub external_addrs: Vec<String>,
+}
+
 /// Run the unified peer node.
-pub async fn run(
-    identity_path: PathBuf,
-    listen_addrs: Vec<String>,
-    bootstrap_addrs: Vec<String>,
-    expose_specs: Vec<String>,
-    tunnel_specs: Vec<String>,
-    nat_status_override: Option<NatStatus>,
-    external_addrs: Vec<String>,
-) -> Result<()> {
-    let keypair = crate::identity::load_or_generate(&identity_path)?;
+pub async fn run(config: NodeConfig) -> Result<()> {
+    let keypair = crate::identity::load_or_generate(&config.identity_path)?;
     let local_peer_id = PeerId::from(keypair.public());
     tracing::info!(%local_peer_id, "starting punchgate node");
 
-    let exposed: Vec<ExposedService> = expose_specs
+    let exposed: Vec<ExposedService> = config
+        .expose_specs
         .iter()
         .map(|s| service::parse_expose(s))
         .collect::<Result<_>>()?;
@@ -83,7 +87,8 @@ pub async fn run(
             .collect(),
     );
 
-    let bootstrap_multiaddrs: Vec<Multiaddr> = bootstrap_addrs
+    let bootstrap_multiaddrs: Vec<Multiaddr> = config
+        .bootstrap_addrs
         .iter()
         .map(|s| s.parse().context("invalid bootstrap multiaddr"))
         .collect::<Result<_>>()?;
@@ -124,7 +129,7 @@ pub async fn run(
     // Parse tunnel specs into deferred pending tunnels (spawned reactively after connection)
     let mut tunnel_registry = TunnelRegistry::new();
     let mut pending_tunnels: HashMap<PeerId, Vec<(String, SocketAddr)>> = HashMap::new();
-    for spec in &tunnel_specs {
+    for spec in &config.tunnel_specs {
         let (remote_peer, service_name, bind_addr) = tunnel::parse_tunnel_spec(spec)?;
         pending_tunnels
             .entry(remote_peer)
@@ -135,14 +140,23 @@ pub async fn run(
     let mut kad_tunnel_queries: HashMap<kad::QueryId, PeerId> = HashMap::new();
     let mut tunnel_peers_dialing: HashSet<PeerId> = HashSet::new();
 
+    // Pending service-name-based tunnels (not yet resolved to a peer)
+    let mut pending_service_tunnels: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+    for spec in &config.tunnel_by_name_specs {
+        let (name, addr) = service::parse_tunnel_by_name(spec)?;
+        pending_service_tunnels.entry(name).or_default().push(addr);
+    }
+    // Track GetProviders query IDs → service names
+    let mut kad_service_queries: HashMap<kad::QueryId, String> = HashMap::new();
+
     // Register external addresses (needed for relay server to include in reservations)
-    for addr_str in &external_addrs {
+    for addr_str in &config.external_addrs {
         let addr: Multiaddr = addr_str.parse().context("invalid external address")?;
         tracing::info!(%addr, "adding external address");
         swarm.add_external_address(addr);
     }
 
-    for addr_str in &listen_addrs {
+    for addr_str in &config.listen_addrs {
         let addr: Multiaddr = addr_str.parse().context("invalid listen multiaddr")?;
         swarm.listen_on(addr)?;
     }
@@ -158,7 +172,7 @@ pub async fn run(
     }
 
     // Apply NAT status override if provided (bypasses AutoNAT wait)
-    if let Some(status) = nat_status_override {
+    if let Some(status) = config.nat_status_override {
         tracing::info!(?status, "applying --nat-status override");
         let old_phase = peer_state.phase;
         let (new_state, commands) = peer_state.transition(Event::NatStatusChanged(status));
@@ -174,6 +188,11 @@ pub async fn run(
 
         if peer_state.phase == Phase::Participating {
             initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
+            initiate_service_lookups(
+                &mut swarm,
+                &pending_service_tunnels,
+                &mut kad_service_queries,
+            );
         }
     }
 
@@ -234,14 +253,79 @@ pub async fn run(
                     && step.last
                     && let Some(target_peer) = kad_tunnel_queries.remove(id)
                 {
-                    match swarm.dial(target_peer) {
-                        Ok(()) => {
-                            tunnel_peers_dialing.insert(target_peer);
-                            tracing::info!(%target_peer, "dialing tunnel target after DHT lookup");
+                    if swarm.is_connected(&target_peer) {
+                        if let Some(specs) = pending_tunnels.remove(&target_peer) {
+                            tracing::info!(%target_peer, "tunnel target already connected, spawning tunnels");
+                            spawn_tunnels(&specs, target_peer, &stream_control, &mut tunnel_registry);
+                        }
+                    } else {
+                        match swarm.dial(target_peer) {
+                            Ok(()) => {
+                                tunnel_peers_dialing.insert(target_peer);
+                                tracing::info!(%target_peer, "dialing tunnel target after DHT lookup");
+                            }
+                            Err(e) => {
+                                tracing::error!(%target_peer, error = %e, "failed to dial tunnel target");
+                                pending_tunnels.remove(&target_peer);
+                            }
+                        }
+                    }
+                }
+
+                // Handle Kademlia GetProviders results for service-name discovery
+                if let SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::GetProviders(result),
+                        ..
+                    }
+                )) = &event
+                    && kad_service_queries.contains_key(id)
+                {
+                    match result {
+                        Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => {
+                            if let Some(first_provider) = providers.iter().next()
+                                && let Some(service_name) = kad_service_queries.remove(id)
+                                && let Some(bind_addrs) = pending_service_tunnels.remove(&service_name)
+                            {
+                                let specs: Vec<(String, SocketAddr)> = bind_addrs
+                                    .into_iter()
+                                    .map(|addr| (service_name.clone(), addr))
+                                    .collect();
+
+                                if swarm.is_connected(first_provider) {
+                                    tracing::info!(
+                                        %service_name, %first_provider,
+                                        "service provider already connected, spawning tunnels"
+                                    );
+                                    spawn_tunnels(&specs, *first_provider, &stream_control, &mut tunnel_registry);
+                                } else {
+                                    pending_tunnels
+                                        .entry(*first_provider)
+                                        .or_default()
+                                        .extend(specs);
+                                    let query_id = swarm.behaviour_mut().kademlia
+                                        .get_closest_peers(*first_provider);
+                                    kad_tunnel_queries.insert(query_id, *first_provider);
+                                    tracing::info!(
+                                        %service_name, %first_provider,
+                                        "service provider discovered, initiating connection"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }) => {
+                            if let Some(service_name) = kad_service_queries.remove(id)
+                                && pending_service_tunnels.contains_key(&service_name)
+                            {
+                                tracing::warn!(%service_name, "DHT lookup finished with no providers");
+                            }
                         }
                         Err(e) => {
-                            tracing::error!(%target_peer, error = %e, "failed to dial tunnel target");
-                            pending_tunnels.remove(&target_peer);
+                            if let Some(service_name) = kad_service_queries.remove(id) {
+                                pending_service_tunnels.remove(&service_name);
+                                tracing::error!(%service_name, error = %e, "service provider lookup failed");
+                            }
                         }
                     }
                 }
@@ -296,6 +380,7 @@ pub async fn run(
                     // Initiate DHT lookups when transitioning to Participating
                     if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
                         initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
+                        initiate_service_lookups(&mut swarm, &pending_service_tunnels, &mut kad_service_queries);
                     }
 
                     if peer_state.phase == Phase::ShuttingDown {
@@ -323,6 +408,7 @@ pub async fn run(
 
                 if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
                     initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
+                    initiate_service_lookups(&mut swarm, &pending_service_tunnels, &mut kad_service_queries);
                 }
             }
             _ = republish_interval.tick(), if peer_state.phase == Phase::Participating => {
@@ -563,6 +649,10 @@ fn execute_commands(
                     tracing::warn!(error = %e, "start_providing failed");
                 }
             }
+            Command::KademliaGetProviders { key } => {
+                let record_key = kad::RecordKey::new(key);
+                swarm.behaviour_mut().kademlia.get_providers(record_key);
+            }
             Command::KademliaPutRecord { key, value } => {
                 let record = kad::Record::new(key.clone(), value.clone());
                 if let Err(e) = swarm
@@ -679,6 +769,20 @@ fn initiate_tunnel_lookups(
     }
 }
 
+fn initiate_service_lookups(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    pending_service_tunnels: &HashMap<String, Vec<SocketAddr>>,
+    kad_service_queries: &mut HashMap<kad::QueryId, String>,
+) {
+    for service_name in pending_service_tunnels.keys() {
+        let key = service::service_key(service_name);
+        let record_key = kad::RecordKey::new(&key);
+        let query_id = swarm.behaviour_mut().kademlia.get_providers(record_key);
+        kad_service_queries.insert(query_id, service_name.clone());
+        tracing::info!(%service_name, "starting DHT provider lookup");
+    }
+}
+
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     addr.iter().find_map(|proto| {
         if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
@@ -706,6 +810,8 @@ fn event_name(event: &Event) -> &'static str {
         Event::HolePunchSucceeded { .. } => "HolePunchSucceeded",
         Event::HolePunchFailed { .. } => "HolePunchFailed",
         Event::ConnectionLost { .. } => "ConnectionLost",
+        Event::ServiceProvidersFound { .. } => "ServiceProvidersFound",
+        Event::ServiceLookupFailed { .. } => "ServiceLookupFailed",
     }
 }
 

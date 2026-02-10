@@ -43,7 +43,6 @@ TUNNEL_PORT=2222
 # Compose reads ${VAR} references from the process environment.
 # Export placeholders so early `up` calls don't fail on unset variables.
 export BOOTSTRAP_ID=""
-export WORKHORSE_ID=""
 
 # ── Colour helpers ─────────────────────────────────────────────────────────
 
@@ -128,7 +127,7 @@ wait_for_container_log workhorse "listening on /ip4/" "workhorse listening"
 log "waiting for workhorse relay reservation..."
 wait_for_container_log workhorse "relay reservation accepted" "workhorse relay reservation"
 
-export WORKHORSE_ID=$(parse_peer_id workhorse)
+WORKHORSE_ID=$(parse_peer_id workhorse)
 
 if [[ -z "$WORKHORSE_ID" ]]; then
     fail "could not parse workhorse peer ID from logs"
@@ -138,7 +137,7 @@ log "workhorse peer ID = $WORKHORSE_ID"
 
 # ── Step 4: Start client ──────────────────────────────────────────────────
 
-log "starting client (--tunnel $WORKHORSE_ID:echo@0.0.0.0:$TUNNEL_PORT)..."
+log "starting client (--tunnel-by-name echo@0.0.0.0:$TUNNEL_PORT)..."
 $COMPOSE up -d --no-recreate client
 
 wait_for_container_log client "listening on /ip4/" "client listening"
@@ -179,5 +178,5 @@ else
     fail "tunnel echo mismatch"
 fi
 
-log "data path: nc → :$TUNNEL_PORT → client → bootstrap relay → workhorse → echo → back"
+log "data path: nc → :$TUNNEL_PORT → client (--tunnel-by-name) → bootstrap relay → workhorse → echo → back"
 log "done."

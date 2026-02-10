@@ -32,6 +32,10 @@ struct Cli {
     #[arg(long)]
     tunnel: Vec<String>,
 
+    /// Tunnel to a service by name (discovers provider via DHT): service_name@bind_addr
+    #[arg(long)]
+    tunnel_by_name: Vec<String>,
+
     /// Override NAT status detection (private or public).
     /// When set, bypasses AutoNAT wait and immediately enters participation.
     #[arg(long)]
@@ -67,14 +71,15 @@ async fn main() -> Result<()> {
         .map(parse_nat_status)
         .transpose()?;
 
-    cli::node::run(
-        cli.identity,
-        cli.listen,
-        cli.bootstrap,
-        cli.expose,
-        cli.tunnel,
-        nat_status,
-        cli.external_address,
-    )
+    cli::node::run(cli::node::NodeConfig {
+        identity_path: cli.identity,
+        listen_addrs: cli.listen,
+        bootstrap_addrs: cli.bootstrap,
+        expose_specs: cli.expose,
+        tunnel_specs: cli.tunnel,
+        tunnel_by_name_specs: cli.tunnel_by_name,
+        nat_status_override: nat_status,
+        external_addrs: cli.external_address,
+    })
     .await
 }

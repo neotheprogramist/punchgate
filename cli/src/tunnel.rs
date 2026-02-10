@@ -50,7 +50,8 @@ async fn read_message<T: for<'de> Deserialize<'de>>(
     // Infallible: u32 always fits in usize on all Rust std-supported platforms (>= 32-bit)
     let len = usize::try_from(u32::from_be_bytes(len_buf))
         .expect("u32 fits in usize on all supported platforms");
-    if len > 1024 * 64 {
+    const MAX_MESSAGE_SIZE: usize = 65536;
+    if len > MAX_MESSAGE_SIZE {
         bail!("message too large: {len} bytes");
     }
     let mut buf = vec![0u8; len];

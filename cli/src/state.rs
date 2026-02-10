@@ -23,6 +23,9 @@ pub enum Command {
         key: Vec<u8>,
         value: Vec<u8>,
     },
+    KademliaGetProviders {
+        key: Vec<u8>,
+    },
     RequestRelayReservation {
         relay_peer: PeerId,
         relay_addr: Multiaddr,
@@ -80,6 +83,14 @@ pub enum Event {
     ConnectionLost {
         peer: PeerId,
         remaining_connections: u32,
+    },
+    ServiceProvidersFound {
+        service_name: String,
+        providers: Vec<PeerId>,
+    },
+    ServiceLookupFailed {
+        service_name: String,
+        reason: String,
     },
 }
 
@@ -337,6 +348,25 @@ impl PeerState {
                         commands.push(Command::Log("all peers lost, re-entering discovery".into()));
                     }
                 }
+            }
+
+            Event::ServiceProvidersFound {
+                service_name,
+                providers,
+            } => {
+                commands.push(Command::Log(format!(
+                    "found {} provider(s) for service '{service_name}'",
+                    providers.len()
+                )));
+            }
+
+            Event::ServiceLookupFailed {
+                service_name,
+                reason,
+            } => {
+                commands.push(Command::Log(format!(
+                    "service lookup failed for '{service_name}': {reason}"
+                )));
             }
 
             Event::ShutdownRequested => {
@@ -826,6 +856,52 @@ mod tests {
                 Command::AddExternalAddress(a) if *a == addr
             ));
             prop_assert!(has_add_external);
+        }
+
+        // ServiceProvidersFound logs but preserves all state dimensions
+        #[test]
+        fn service_providers_found_logs_and_preserves_state(
+            phase in arb_phase(),
+            nat_status in arb_nat_status(),
+            service_name in "[a-z]{1,10}",
+            providers in proptest::collection::vec(arb_peer_id(), 0..5),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = phase;
+            state.nat_status = nat_status;
+
+            let (new_state, commands) = state.transition(Event::ServiceProvidersFound {
+                service_name,
+                providers,
+            });
+
+            prop_assert_eq!(new_state.phase, phase);
+            prop_assert_eq!(new_state.nat_status, nat_status);
+            let has_log = commands.iter().any(|c| matches!(c, Command::Log(_)));
+            prop_assert!(has_log);
+        }
+
+        // ServiceLookupFailed logs but preserves all state dimensions
+        #[test]
+        fn service_lookup_failed_logs_and_preserves_state(
+            phase in arb_phase(),
+            nat_status in arb_nat_status(),
+            service_name in "[a-z]{1,10}",
+            reason in "[a-z ]{1,20}",
+        ) {
+            let mut state = PeerState::new();
+            state.phase = phase;
+            state.nat_status = nat_status;
+
+            let (new_state, commands) = state.transition(Event::ServiceLookupFailed {
+                service_name,
+                reason,
+            });
+
+            prop_assert_eq!(new_state.phase, phase);
+            prop_assert_eq!(new_state.nat_status, nat_status);
+            let has_log = commands.iter().any(|c| matches!(c, Command::Log(_)));
+            prop_assert!(has_log);
         }
 
         // RelayReservationAccepted emits PublishServices to refresh DHT
