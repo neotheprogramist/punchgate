@@ -1,5 +1,5 @@
 ARG APP_NAME=cli
-ARG FEATURES=--no-default-features
+ARG FEATURES=
 
 FROM rust:1.92.0-alpine3.21 AS base
 RUN apk add --no-cache build-base libressl-dev

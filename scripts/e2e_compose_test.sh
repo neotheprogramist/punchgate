@@ -98,7 +98,7 @@ parse_peer_id() {
 # ── Step 1: Build image ───────────────────────────────────────────────────
 
 log "building punchgate:local image (mDNS disabled)..."
-$COMPOSE build bootstrap
+$COMPOSE build --build-arg FEATURES=--no-default-features bootstrap
 
 # ── Step 2: Start echo + bootstrap ─────────────────────────────────────────
 

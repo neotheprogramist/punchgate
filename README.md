@@ -257,7 +257,7 @@ The data path: `ssh → TCP:2222 → Client → [DCUtR direct or relay] → Work
 
 ### Container E2E Test: NAT Traversal via Compose
 
-The full relay → DCUtR → tunnel flow can be tested locally using containers. The image is built with `--no-default-features` (mDNS disabled), forcing all discovery through the Kademlia DHT — same as a real multi-network deployment.
+The full relay → DCUtR → tunnel flow can be tested locally using containers. The test script builds the image with `--no-default-features` (mDNS disabled), forcing all discovery through the Kademlia DHT — same as a real multi-network deployment.
 
 Requires `podman compose`.
 
@@ -279,11 +279,11 @@ Startup is phased: bootstrap starts first (peer ID parsed from logs), then workh
 To build the image separately:
 
 ```bash
-# E2E test image (no mDNS — default)
+# Production image (mDNS enabled — default)
 podman build -t punchgate:local .
 
-# Production image (mDNS enabled)
-podman build -t punchgate:local --build-arg FEATURES="" .
+# E2E test image (no mDNS — forces DHT-only discovery)
+podman build -t punchgate:local --build-arg FEATURES=--no-default-features .
 ```
 
 ## Observability
