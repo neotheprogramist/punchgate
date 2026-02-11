@@ -1,10 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
 use libp2p::{PeerId, Stream as LibP2pStream};
 use libp2p_stream::IncomingStreams;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
@@ -12,7 +13,7 @@ use tokio::{
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::protocol;
+use crate::{protocol, service::ServiceAddr};
 
 // ─── Wire format ────────────────────────────────────────────────────────────
 
@@ -64,7 +65,7 @@ async fn read_message<T: for<'de> Deserialize<'de>>(
 /// Accept incoming tunnel streams and proxy them to local services.
 pub async fn accept_loop(
     mut incoming: IncomingStreams,
-    services: Arc<HashMap<String, SocketAddr>>,
+    services: Arc<HashMap<String, ServiceAddr>>,
 ) {
     use futures::StreamExt;
 
@@ -81,12 +82,12 @@ pub async fn accept_loop(
 async fn handle_tunnel(
     peer_id: PeerId,
     mut stream: LibP2pStream,
-    services: &HashMap<String, SocketAddr>,
+    services: &HashMap<String, ServiceAddr>,
 ) -> Result<()> {
     let request: TunnelRequest = read_message(&mut stream).await?;
     tracing::info!(%peer_id, service = %request.service_name, "tunnel request");
 
-    let Some(&local_addr) = services.get(&request.service_name) else {
+    let Some(local_addr) = services.get(&request.service_name) else {
         tracing::warn!(%peer_id, service = %request.service_name, reason = "unknown service", "tunnel rejected");
         write_message(
             &mut stream,
@@ -99,7 +100,7 @@ async fn handle_tunnel(
         return Ok(());
     };
 
-    let tcp_stream = TcpStream::connect(local_addr)
+    let tcp_stream = TcpStream::connect(local_addr.connect_tuple())
         .await
         .with_context(|| format!("connecting to local service at {local_addr}"))?;
 
@@ -216,27 +217,55 @@ async fn client_tunnel_session(
     Ok(())
 }
 
-// ─── Tunnel spec parsing ────────────────────────────────────────────────────
+// ─── TunnelSpec ──────────────────────────────────────────────────────────────
 
-/// Parse a `--tunnel` spec: `peer_id:service_name@bind_addr`
-pub fn parse_tunnel_spec(spec: &str) -> Result<(PeerId, String, SocketAddr)> {
-    let (peer_and_service, bind_str) = spec
-        .rsplit_once('@')
-        .context("tunnel format: peer_id:service_name@bind_addr")?;
+#[derive(Debug, Clone)]
+pub struct TunnelSpec {
+    pub remote_peer: PeerId,
+    pub service_name: String,
+    pub bind_addr: SocketAddr,
+}
 
-    let (peer_str, service_name) = peer_and_service
-        .split_once(':')
-        .context("tunnel format: peer_id:service_name@bind_addr")?;
+#[derive(Debug, Error)]
+pub enum TunnelSpecParseError {
+    #[error("tunnel format: peer_id:service_name@bind_addr (missing '@')")]
+    MissingBindSeparator,
+    #[error("tunnel format: peer_id:service_name@bind_addr (missing ':')")]
+    MissingPeerSeparator,
+    #[error("invalid peer ID: {0}")]
+    InvalidPeerId(String),
+    #[error("invalid bind address: {0}")]
+    InvalidBindAddr(#[from] std::net::AddrParseError),
+}
 
-    let peer_id: PeerId = peer_str
-        .parse()
-        .with_context(|| format!("invalid peer ID: {peer_str}"))?;
+impl FromStr for TunnelSpec {
+    type Err = TunnelSpecParseError;
 
-    let bind_addr: SocketAddr = bind_str
-        .parse()
-        .with_context(|| format!("invalid bind address: {bind_str}"))?;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (peer_and_service, bind_str) = s
+            .rsplit_once('@')
+            .ok_or(TunnelSpecParseError::MissingBindSeparator)?;
 
-    Ok((peer_id, service_name.to_string(), bind_addr))
+        let (peer_str, service_name) = peer_and_service
+            .split_once(':')
+            .ok_or(TunnelSpecParseError::MissingPeerSeparator)?;
+
+        let remote_peer: PeerId = peer_str
+            .parse()
+            .map_err(|e| TunnelSpecParseError::InvalidPeerId(format!("{e}")))?;
+
+        let bind_addr: SocketAddr = bind_str.parse()?;
+
+        Ok(Self {
+            remote_peer,
+            service_name: service_name.to_string(),
+            bind_addr,
+        })
+    }
+}
+
+pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelSpec> {
+    spec.parse().map_err(Into::into)
 }
 
 // ─── Tunnel registry ────────────────────────────────────────────────────────
@@ -335,7 +364,21 @@ mod tests {
     }
 
     proptest! {
-        // Roundtrip: parse_tunnel_spec recovers original components from formatted spec
+        // Roundtrip: TunnelSpec FromStr recovers original components
+        #[test]
+        fn tunnel_spec_roundtrip(
+            peer_id in arb_peer_id(),
+            service in arb_service_name(),
+            addr in arb_socket_addr(),
+        ) {
+            let spec = format!("{peer_id}:{service}@{addr}");
+            let parsed: TunnelSpec = spec.parse().expect("parse generated tunnel spec");
+            prop_assert_eq!(parsed.remote_peer, peer_id);
+            prop_assert_eq!(parsed.service_name, service);
+            prop_assert_eq!(parsed.bind_addr, addr);
+        }
+
+        // parse_tunnel_spec wrapper delegates to FromStr
         #[test]
         fn parse_tunnel_spec_roundtrip(
             peer_id in arb_peer_id(),
@@ -343,11 +386,10 @@ mod tests {
             addr in arb_socket_addr(),
         ) {
             let spec = format!("{peer_id}:{service}@{addr}");
-            let (parsed_pid, parsed_name, parsed_addr) =
-                parse_tunnel_spec(&spec).expect("parse generated tunnel spec");
-            prop_assert_eq!(parsed_pid, peer_id);
-            prop_assert_eq!(parsed_name, service);
-            prop_assert_eq!(parsed_addr, addr);
+            let parsed = parse_tunnel_spec(&spec).expect("parse generated tunnel spec");
+            prop_assert_eq!(parsed.remote_peer, peer_id);
+            prop_assert_eq!(parsed.service_name, service);
+            prop_assert_eq!(parsed.bind_addr, addr);
         }
     }
 }

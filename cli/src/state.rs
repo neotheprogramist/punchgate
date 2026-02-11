@@ -1,6 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    str::FromStr,
+};
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
+use thiserror::Error;
 
 // ─── Command (output alphabet) ─────────────────────────────────────────────
 
@@ -115,6 +120,32 @@ pub enum NatStatus {
     Unknown,
     Public,
     Private,
+}
+
+#[derive(Debug, Error)]
+#[error("invalid NAT status '{0}': must be 'private' or 'public'")]
+pub struct NatStatusParseError(String);
+
+impl FromStr for NatStatus {
+    type Err = NatStatusParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "private" => Ok(NatStatus::Private),
+            "public" => Ok(NatStatus::Public),
+            other => Err(NatStatusParseError(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for NatStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NatStatus::Unknown => write!(f, "unknown"),
+            NatStatus::Public => write!(f, "public"),
+            NatStatus::Private => write!(f, "private"),
+        }
+    }
 }
 
 /// State of relay circuit reservation.
@@ -912,6 +943,24 @@ mod tests {
 
             let (_, commands) = state.transition(Event::RelayReservationAccepted { relay_peer });
             prop_assert!(commands.contains(&Command::PublishServices));
+        }
+
+        // NatStatus FromStr roundtrip for valid values
+        #[test]
+        fn nat_status_fromstr_roundtrip(
+            status in prop_oneof![Just(NatStatus::Public), Just(NatStatus::Private)],
+        ) {
+            let s = status.to_string();
+            let parsed: NatStatus = s.parse().expect("parse valid NatStatus string");
+            prop_assert_eq!(parsed, status);
+        }
+
+        // NatStatus FromStr rejects invalid input
+        #[test]
+        fn nat_status_fromstr_rejects_invalid(s in "[a-z]{1,10}") {
+            prop_assume!(s != "private" && s != "public");
+            let result: Result<NatStatus, _> = s.parse();
+            prop_assert!(result.is_err());
         }
     }
 }

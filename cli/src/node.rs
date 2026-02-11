@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::StreamExt;
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
@@ -18,9 +18,9 @@ use libp2p::{
 use crate::{
     behaviour::{Behaviour, BehaviourEvent},
     protocol::{self, DISCOVERY_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
-    service::{self, ExposedService},
+    service::{self, ExposedService, ServiceAddr, TunnelByNameSpec},
     state::{Command, Event, NatStatus, PeerState, Phase},
-    tunnel::{self, TunnelRegistry},
+    tunnel::{self, TunnelRegistry, TunnelSpec},
 };
 
 // ─── Reconnection backoff ───────────────────────────────────────────────────
@@ -59,13 +59,13 @@ impl ReconnectBackoff {
 
 pub struct NodeConfig {
     pub identity_path: PathBuf,
-    pub listen_addrs: Vec<String>,
-    pub bootstrap_addrs: Vec<String>,
-    pub expose_specs: Vec<String>,
-    pub tunnel_specs: Vec<String>,
-    pub tunnel_by_name_specs: Vec<String>,
+    pub listen_addrs: Vec<Multiaddr>,
+    pub bootstrap_addrs: Vec<Multiaddr>,
+    pub exposed: Vec<ExposedService>,
+    pub tunnel_specs: Vec<TunnelSpec>,
+    pub tunnel_by_name_specs: Vec<TunnelByNameSpec>,
     pub nat_status_override: Option<NatStatus>,
-    pub external_addrs: Vec<String>,
+    pub external_addrs: Vec<Multiaddr>,
 }
 
 /// Run the unified peer node.
@@ -74,26 +74,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let local_peer_id = PeerId::from(keypair.public());
     tracing::info!(%local_peer_id, "starting punchgate node");
 
-    let exposed: Vec<ExposedService> = config
-        .expose_specs
-        .iter()
-        .map(|s| service::parse_expose(s))
-        .collect::<Result<_>>()?;
-
-    let services: Arc<HashMap<String, SocketAddr>> = Arc::new(
-        exposed
+    let services: Arc<HashMap<String, ServiceAddr>> = Arc::new(
+        config
+            .exposed
             .iter()
-            .map(|s| (s.name.clone(), s.local_addr))
+            .map(|s| (s.name.clone(), s.local_addr.clone()))
             .collect(),
     );
 
-    let bootstrap_multiaddrs: Vec<Multiaddr> = config
+    let bootstrap_peers_with_addrs: Vec<(PeerId, Multiaddr)> = config
         .bootstrap_addrs
-        .iter()
-        .map(|s| s.parse().context("invalid bootstrap multiaddr"))
-        .collect::<Result<_>>()?;
-
-    let bootstrap_peers_with_addrs: Vec<(PeerId, Multiaddr)> = bootstrap_multiaddrs
         .iter()
         .filter_map(|addr| extract_peer_id(addr).map(|pid| (pid, addr.clone())))
         .collect();
@@ -126,15 +116,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("tunnel protocol already registered"))?;
     tokio::spawn(tunnel::accept_loop(incoming, services.clone()));
 
-    // Parse tunnel specs into deferred pending tunnels (spawned reactively after connection)
+    // Build deferred pending tunnels from typed specs (spawned reactively after connection)
     let mut tunnel_registry = TunnelRegistry::new();
     let mut pending_tunnels: HashMap<PeerId, Vec<(String, SocketAddr)>> = HashMap::new();
     for spec in &config.tunnel_specs {
-        let (remote_peer, service_name, bind_addr) = tunnel::parse_tunnel_spec(spec)?;
         pending_tunnels
-            .entry(remote_peer)
+            .entry(spec.remote_peer)
             .or_default()
-            .push((service_name, bind_addr));
+            .push((spec.service_name.clone(), spec.bind_addr));
     }
 
     let mut kad_tunnel_queries: HashMap<kad::QueryId, PeerId> = HashMap::new();
@@ -143,25 +132,25 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // Pending service-name-based tunnels (not yet resolved to a peer)
     let mut pending_service_tunnels: HashMap<String, Vec<SocketAddr>> = HashMap::new();
     for spec in &config.tunnel_by_name_specs {
-        let (name, addr) = service::parse_tunnel_by_name(spec)?;
-        pending_service_tunnels.entry(name).or_default().push(addr);
+        pending_service_tunnels
+            .entry(spec.service_name.clone())
+            .or_default()
+            .push(spec.bind_addr);
     }
     // Track GetProviders query IDs → service names
     let mut kad_service_queries: HashMap<kad::QueryId, String> = HashMap::new();
 
     // Register external addresses (needed for relay server to include in reservations)
-    for addr_str in &config.external_addrs {
-        let addr: Multiaddr = addr_str.parse().context("invalid external address")?;
+    for addr in &config.external_addrs {
         tracing::info!(%addr, "adding external address");
-        swarm.add_external_address(addr);
+        swarm.add_external_address(addr.clone());
     }
 
-    for addr_str in &config.listen_addrs {
-        let addr: Multiaddr = addr_str.parse().context("invalid listen multiaddr")?;
-        swarm.listen_on(addr)?;
+    for addr in &config.listen_addrs {
+        swarm.listen_on(addr.clone())?;
     }
 
-    for addr in &bootstrap_multiaddrs {
+    for addr in &config.bootstrap_addrs {
         tracing::info!(%addr, "dialing bootstrap peer");
         swarm.dial(addr.clone())?;
     }
@@ -184,7 +173,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             );
         }
         peer_state = new_state;
-        execute_commands(&mut swarm, &commands, &exposed);
+        execute_commands(&mut swarm, &commands, &config.exposed);
 
         if peer_state.phase == Phase::Participating {
             initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
@@ -374,7 +363,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     execute_commands(
                         &mut swarm,
                         &commands,
-                        &exposed,
+                        &config.exposed,
                     );
 
                     // Initiate DHT lookups when transitioning to Participating
@@ -404,7 +393,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                 }
                 peer_state = new_state;
-                execute_commands(&mut swarm, &commands, &exposed);
+                execute_commands(&mut swarm, &commands, &config.exposed);
 
                 if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
                     initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
@@ -412,7 +401,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
             }
             _ = republish_interval.tick(), if peer_state.phase == Phase::Participating => {
-                publish_services(&mut swarm, &exposed);
+                publish_services(&mut swarm, &config.exposed);
             }
             _ = async {
                 if let Some(deadline) = next_reconnect {
@@ -461,7 +450,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                 }
                 peer_state = new_state;
-                execute_commands(&mut swarm, &commands, &exposed);
+                execute_commands(&mut swarm, &commands, &config.exposed);
                 if peer_state.phase == Phase::ShuttingDown {
                     tracing::info!("shutting down");
                     break;

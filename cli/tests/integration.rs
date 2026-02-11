@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::StreamExt;
 #[cfg(feature = "mdns")]
@@ -194,8 +194,13 @@ async fn service_discovery_tunnel() {
     });
 
     // Register tunnel accept on Peer B
-    let services: Arc<HashMap<String, SocketAddr>> =
-        Arc::new([("echo".to_string(), echo_addr)].into());
+    let services: Arc<HashMap<String, cli::service::ServiceAddr>> = Arc::new(
+        [(
+            "echo".to_string(),
+            cli::service::ServiceAddr::from(echo_addr),
+        )]
+        .into(),
+    );
 
     let incoming_b = control_b
         .accept(cli::protocol::tunnel_protocol())
@@ -499,8 +504,13 @@ async fn three_peer_tunnel() {
     });
 
     // Register tunnel accept on Peer B
-    let services: Arc<HashMap<String, SocketAddr>> =
-        Arc::new([("echo".to_string(), echo_addr)].into());
+    let services: Arc<HashMap<String, cli::service::ServiceAddr>> = Arc::new(
+        [(
+            "echo".to_string(),
+            cli::service::ServiceAddr::from(echo_addr),
+        )]
+        .into(),
+    );
 
     let incoming_b = control_b
         .accept(cli::protocol::tunnel_protocol())
