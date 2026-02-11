@@ -17,33 +17,38 @@ struct Cli {
     identity: PathBuf,
 
     /// Multiaddr(s) to listen on.
-    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
+    #[arg(
+        long,
+        default_value = "/ip4/0.0.0.0/tcp/0",
+        env = "PUNCHGATE_LISTEN",
+        value_delimiter = ','
+    )]
     listen: Vec<String>,
 
     /// Bootstrap peer multiaddr(s) to dial on startup.
-    #[arg(long)]
+    #[arg(long, env = "PUNCHGATE_BOOTSTRAP", value_delimiter = ',')]
     bootstrap: Vec<String>,
 
     /// Expose a local service: name=host:port
-    #[arg(long)]
+    #[arg(long, env = "PUNCHGATE_EXPOSE", value_delimiter = ',')]
     expose: Vec<String>,
 
     /// Tunnel to a remote service: peer_id:service_name@bind_addr
-    #[arg(long)]
+    #[arg(long, env = "PUNCHGATE_TUNNEL", value_delimiter = ',')]
     tunnel: Vec<String>,
 
     /// Tunnel to a service by name (discovers provider via DHT): service_name@bind_addr
-    #[arg(long)]
+    #[arg(long, env = "PUNCHGATE_TUNNEL_BY_NAME", value_delimiter = ',')]
     tunnel_by_name: Vec<String>,
 
     /// Override NAT status detection (private or public).
     /// When set, bypasses AutoNAT wait and immediately enters participation.
-    #[arg(long)]
+    #[arg(long, env = "PUNCHGATE_NAT_STATUS")]
     nat_status: Option<String>,
 
     /// Declare external address(es) for this node.
     /// Required for relay servers so clients learn how to reach the relay.
-    #[arg(long)]
+    #[arg(long, env = "PUNCHGATE_EXTERNAL_ADDRESS", value_delimiter = ',')]
     external_address: Vec<String>,
 }
 

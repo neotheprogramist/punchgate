@@ -21,11 +21,9 @@ services:
     networks:
       punchnet:
         ipv4_address: 172.28.0.10
-    command:
-      - "--listen"
-      - "/ip4/0.0.0.0/tcp/4001"
-      - "--external-address"
-      - "/ip4/172.28.0.10/tcp/4001"
+    environment:
+      PUNCHGATE_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      PUNCHGATE_EXTERNAL_ADDRESS: "/ip4/172.28.0.10/tcp/4001"
 
   workhorse:
     image: punchgate:local
@@ -35,15 +33,11 @@ services:
     networks:
       punchnet:
         ipv4_address: 172.28.0.30
-    command:
-      - "--listen"
-      - "/ip4/0.0.0.0/tcp/4001"
-      - "--bootstrap"
-      - "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
-      - "--nat-status"
-      - "private"
-      - "--expose"
-      - "echo=172.28.0.20:7777"
+    environment:
+      PUNCHGATE_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      PUNCHGATE_BOOTSTRAP: "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
+      PUNCHGATE_NAT_STATUS: "private"
+      PUNCHGATE_EXPOSE: "echo=172.28.0.20:7777"
 
   client:
     image: punchgate:local
@@ -54,10 +48,7 @@ services:
         ipv4_address: 172.28.0.40
     ports:
       - "2222:2222"
-    command:
-      - "--listen"
-      - "/ip4/0.0.0.0/tcp/4001"
-      - "--bootstrap"
-      - "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
-      - "--tunnel-by-name"
-      - "echo@0.0.0.0:2222"
+    environment:
+      PUNCHGATE_LISTEN: "/ip4/0.0.0.0/tcp/4001"
+      PUNCHGATE_BOOTSTRAP: "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
+      PUNCHGATE_TUNNEL_BY_NAME: "echo@0.0.0.0:2222"
