@@ -19,6 +19,7 @@ use crate::{
     behaviour::{Behaviour, BehaviourEvent},
     protocol::{self, DISCOVERY_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
     service::{self, ExposedService, ServiceAddr, TunnelByNameSpec},
+    shutdown,
     state::{Command, Event, NatStatus, PeerState, Phase},
     tunnel::{self, TunnelRegistry, TunnelSpec},
 };
@@ -436,7 +437,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown::shutdown_signal() => {
                 let old_phase = peer_state.phase;
                 let (new_state, commands) = peer_state.transition(Event::ShutdownRequested);
                 tracing::debug!(event = "ShutdownRequested", commands = commands.len(), "event processed");

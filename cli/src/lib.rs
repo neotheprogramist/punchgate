@@ -3,5 +3,6 @@ pub mod identity;
 pub mod node;
 pub mod protocol;
 pub mod service;
+pub mod shutdown;
 pub mod state;
 pub mod tunnel;
