@@ -262,10 +262,10 @@ async fn service_discovery_tunnel() {
     });
 
     // Register tunnel accept on Peer B
-    let services: Arc<HashMap<String, cli::service::ServiceAddr>> = Arc::new(
+    let services: Arc<HashMap<cli::types::ServiceName, cli::specs::ServiceAddr>> = Arc::new(
         [(
-            "echo".to_string(),
-            cli::service::ServiceAddr::from(echo_addr),
+            cli::types::ServiceName::new("echo"),
+            cli::specs::ServiceAddr::from(echo_addr),
         )]
         .into(),
     );
@@ -345,7 +345,8 @@ async fn service_discovery_tunnel() {
                     },
                 )) if connected_to_a => {
                     // Advertise "echo" service in DHT
-                    let key = cli::service::service_key("echo");
+                    let key =
+                        cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
                     let record_key = kad::RecordKey::new(&key);
                     let _ = swarm_b.behaviour_mut().kademlia.start_providing(record_key);
                 }
@@ -411,7 +412,7 @@ async fn service_discovery_tunnel() {
                             },
                         )) if !queried_providers => {
                             queried_providers = true;
-                            let key = cli::service::service_key("echo");
+                            let key = cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
                             let record_key = kad::RecordKey::new(&key);
                             swarm_c.behaviour_mut().kademlia.get_providers(record_key);
                         }
@@ -447,7 +448,7 @@ async fn service_discovery_tunnel() {
                 }
                 // Retry get_providers periodically (DHT may need time to propagate)
                 _ = retry_interval.tick(), if queried_providers && discovered_provider.is_none() => {
-                    let key = cli::service::service_key("echo");
+                    let key = cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
                     let record_key = kad::RecordKey::new(&key);
                     swarm_c.behaviour_mut().kademlia.get_providers(record_key);
                 }
@@ -463,7 +464,7 @@ async fn service_discovery_tunnel() {
                     .expect("open tunnel stream to provider");
 
                 let req = serde_json::to_vec(&cli::tunnel::TunnelRequest {
-                    service_name: "echo".into(),
+                    service_name: cli::types::ServiceName::new("echo"),
                 })
                 .expect("serialize tunnel request");
                 let len = u32::try_from(req.len())
@@ -572,10 +573,10 @@ async fn three_peer_tunnel() {
     });
 
     // Register tunnel accept on Peer B
-    let services: Arc<HashMap<String, cli::service::ServiceAddr>> = Arc::new(
+    let services: Arc<HashMap<cli::types::ServiceName, cli::specs::ServiceAddr>> = Arc::new(
         [(
-            "echo".to_string(),
-            cli::service::ServiceAddr::from(echo_addr),
+            cli::types::ServiceName::new("echo"),
+            cli::specs::ServiceAddr::from(echo_addr),
         )]
         .into(),
     );
@@ -678,7 +679,7 @@ async fn three_peer_tunnel() {
     // Send tunnel request (length-prefixed JSON)
     use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
     let req = serde_json::to_vec(&cli::tunnel::TunnelRequest {
-        service_name: "echo".into(),
+        service_name: cli::types::ServiceName::new("echo"),
     })
     .expect("serialize tunnel request");
     let len = u32::try_from(req.len())

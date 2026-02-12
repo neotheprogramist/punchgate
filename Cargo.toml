@@ -32,6 +32,7 @@ serde_json = "1.0"
 itertools = "0.14"
 proptest = "1"
 tempfile = "3"
+strum = { version = "0.26", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }

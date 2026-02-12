@@ -2,10 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{
-    service::{ExposedService, TunnelByNameSpec},
-    tunnel::TunnelSpec,
-};
+use cli::specs::{ExposedService, TunnelByNameSpec, TunnelSpec};
 use libp2p::Multiaddr;
 use tracing_subscriber::EnvFilter;
 

@@ -1,11 +1,10 @@
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
 use libp2p::{PeerId, Stream as LibP2pStream};
 use libp2p_stream::IncomingStreams;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
@@ -13,16 +12,13 @@ use tokio::{
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::{
-    protocol,
-    service::{ServiceAddr, ServiceAddrParseError},
-};
+use crate::{protocol, specs::ServiceAddr, types::ServiceName};
 
 // ─── Wire format ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelRequest {
-    pub service_name: String,
+    pub service_name: ServiceName,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,10 +62,9 @@ async fn read_message<T: for<'de> Deserialize<'de>>(
 
 // ─── Server side: accept loop ───────────────────────────────────────────────
 
-/// Accept incoming tunnel streams and proxy them to local services.
 pub async fn accept_loop(
     mut incoming: IncomingStreams,
-    services: Arc<HashMap<String, ServiceAddr>>,
+    services: Arc<HashMap<ServiceName, ServiceAddr>>,
 ) {
     use futures::StreamExt;
 
@@ -87,7 +82,7 @@ pub async fn accept_loop(
 async fn handle_tunnel(
     peer_id: PeerId,
     mut stream: LibP2pStream,
-    services: &HashMap<String, ServiceAddr>,
+    services: &HashMap<ServiceName, ServiceAddr>,
 ) -> Result<()> {
     let request: TunnelRequest = read_message(&mut stream).await?;
     tracing::info!(%peer_id, service = %request.service_name, "tunnel request");
@@ -149,11 +144,10 @@ async fn handle_tunnel(
 
 // ─── Client side: connect tunnel ────────────────────────────────────────────
 
-/// Connect to a remote service via a libp2p tunnel and expose it on a local TCP port.
 pub async fn connect_tunnel(
     mut control: libp2p_stream::Control,
     remote_peer: PeerId,
-    service_name: String,
+    service_name: ServiceName,
     bind_addr: ServiceAddr,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr.connect_tuple())
@@ -194,12 +188,12 @@ pub async fn connect_tunnel(
 async fn client_tunnel_session(
     stream: &mut LibP2pStream,
     mut tcp_stream: TcpStream,
-    service_name: &str,
+    service_name: &ServiceName,
 ) -> Result<()> {
     write_message(
         stream,
         &TunnelRequest {
-            service_name: service_name.to_string(),
+            service_name: service_name.clone(),
         },
     )
     .await?;
@@ -227,57 +221,6 @@ async fn client_tunnel_session(
     }
 
     Ok(())
-}
-
-// ─── TunnelSpec ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct TunnelSpec {
-    pub remote_peer: PeerId,
-    pub service_name: String,
-    pub bind_addr: ServiceAddr,
-}
-
-#[derive(Debug, Error)]
-pub enum TunnelSpecParseError {
-    #[error("tunnel format: peer_id:service_name@bind_addr (missing '@')")]
-    MissingBindSeparator,
-    #[error("tunnel format: peer_id:service_name@bind_addr (missing ':')")]
-    MissingPeerSeparator,
-    #[error("invalid peer ID: {0}")]
-    InvalidPeerId(String),
-    #[error("invalid bind address: {0}")]
-    InvalidBindAddr(#[from] ServiceAddrParseError),
-}
-
-impl FromStr for TunnelSpec {
-    type Err = TunnelSpecParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (peer_and_service, bind_str) = s
-            .rsplit_once('@')
-            .ok_or(TunnelSpecParseError::MissingBindSeparator)?;
-
-        let (peer_str, service_name) = peer_and_service
-            .split_once(':')
-            .ok_or(TunnelSpecParseError::MissingPeerSeparator)?;
-
-        let remote_peer: PeerId = peer_str
-            .parse()
-            .map_err(|e| TunnelSpecParseError::InvalidPeerId(format!("{e}")))?;
-
-        let bind_addr: ServiceAddr = bind_str.parse()?;
-
-        Ok(Self {
-            remote_peer,
-            service_name: service_name.to_string(),
-            bind_addr,
-        })
-    }
-}
-
-pub fn parse_tunnel_spec(spec: &str) -> Result<TunnelSpec> {
-    spec.parse().map_err(Into::into)
 }
 
 // ─── Tunnel registry ────────────────────────────────────────────────────────
@@ -316,7 +259,6 @@ impl TunnelRegistry {
         self.tunnels.remove(&id);
     }
 
-    /// Abort all tunnel tasks with a timeout for graceful close.
     pub async fn shutdown_all(&mut self, timeout: Duration) {
         match self.tunnels.len() {
             0 => return,
@@ -334,101 +276,5 @@ impl TunnelRegistry {
 
     pub fn active_count(&self) -> usize {
         self.tunnels.len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::SocketAddr;
-
-    use proptest::prelude::*;
-
-    use super::*;
-
-    fn arb_peer_id() -> impl Strategy<Value = PeerId> {
-        any::<[u8; 32]>().prop_map(|bytes| {
-            // Infallible: any 32 bytes is a valid ed25519 seed
-            let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(bytes)
-                .expect("any 32 bytes is a valid ed25519 seed");
-            let ed_kp = libp2p::identity::ed25519::Keypair::from(secret);
-            let keypair = libp2p::identity::Keypair::from(ed_kp);
-            PeerId::from(keypair.public())
-        })
-    }
-
-    fn arb_service_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9_-]{0,19}"
-    }
-
-    fn arb_socket_addr() -> impl Strategy<Value = SocketAddr> {
-        (
-            1u8..=254,
-            0u8..=255,
-            0u8..=255,
-            1u8..=254,
-            1024u16..65535u16,
-        )
-            .prop_map(|(a, b, c, d, port)| {
-                // Infallible: formatted string is always a valid socket address
-                format!("{a}.{b}.{c}.{d}:{port}")
-                    .parse()
-                    .expect("generated socket address is always valid")
-            })
-    }
-
-    fn arb_domain_host() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9-]{0,9}"
-    }
-
-    fn arb_port() -> impl Strategy<Value = u16> {
-        1024u16..65535u16
-    }
-
-    proptest! {
-        // Roundtrip: TunnelSpec FromStr with IP address
-        #[test]
-        fn tunnel_spec_roundtrip(
-            peer_id in arb_peer_id(),
-            service in arb_service_name(),
-            addr in arb_socket_addr(),
-        ) {
-            let spec = format!("{peer_id}:{service}@{addr}");
-            let parsed: TunnelSpec = spec.parse().expect("parse generated tunnel spec");
-            prop_assert_eq!(parsed.remote_peer, peer_id);
-            prop_assert_eq!(parsed.service_name, service);
-            prop_assert_eq!(parsed.bind_addr.host, addr.ip().to_string());
-            prop_assert_eq!(parsed.bind_addr.port, addr.port());
-        }
-
-        // Roundtrip: TunnelSpec FromStr with domain name
-        #[test]
-        fn tunnel_spec_domain_roundtrip(
-            peer_id in arb_peer_id(),
-            service in arb_service_name(),
-            host in arb_domain_host(),
-            port in arb_port(),
-        ) {
-            let spec = format!("{peer_id}:{service}@{host}:{port}");
-            let parsed: TunnelSpec = spec.parse().expect("parse generated tunnel spec with domain");
-            prop_assert_eq!(parsed.remote_peer, peer_id);
-            prop_assert_eq!(parsed.service_name, service);
-            prop_assert_eq!(parsed.bind_addr.host, host);
-            prop_assert_eq!(parsed.bind_addr.port, port);
-        }
-
-        // parse_tunnel_spec wrapper delegates to FromStr
-        #[test]
-        fn parse_tunnel_spec_roundtrip(
-            peer_id in arb_peer_id(),
-            service in arb_service_name(),
-            addr in arb_socket_addr(),
-        ) {
-            let spec = format!("{peer_id}:{service}@{addr}");
-            let parsed = parse_tunnel_spec(&spec).expect("parse generated tunnel spec");
-            prop_assert_eq!(parsed.remote_peer, peer_id);
-            prop_assert_eq!(parsed.service_name, service);
-            prop_assert_eq!(parsed.bind_addr.host, addr.ip().to_string());
-            prop_assert_eq!(parsed.bind_addr.port, addr.port());
-        }
     }
 }

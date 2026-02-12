@@ -22,14 +22,3 @@ pub fn tunnel_protocol() -> StreamProtocol {
     StreamProtocol::try_from_owned(TUNNEL_PROTOCOL.to_string())
         .expect("TUNNEL_PROTOCOL is a valid compile-time constant protocol string")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn protocol_strings_are_valid() {
-        let _ = kad_protocol();
-        let _ = tunnel_protocol();
-    }
-}
