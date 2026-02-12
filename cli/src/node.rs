@@ -45,8 +45,7 @@ impl ReconnectBackoff {
         let addr = self.addrs.get(&peer)?;
         let delay = self.delays.entry(peer).or_insert(BACKOFF_INITIAL);
         let current = *delay;
-        // Double for next time, capped at max
-        *delay = delay.checked_mul(2).unwrap_or(BACKOFF_MAX);
+        *delay = delay.saturating_mul(2).min(BACKOFF_MAX);
         Some((addr.clone(), current))
     }
 
@@ -156,13 +155,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     if config.bootstrap_addrs.is_empty() {
         let old_phase = peer_state.phase;
         let (new_state, commands) = peer_state.transition(Event::NoBootstrapPeers);
-        if old_phase != new_state.phase {
-            tracing::info!(
-                from = phase_name(old_phase),
-                to = phase_name(new_state.phase),
-                "no bootstrap peers, entering participation directly"
-            );
-        }
+        log_phase_transition(
+            "NoBootstrapPeers",
+            old_phase,
+            new_state.phase,
+            commands.len(),
+        );
         peer_state = new_state;
         execute_commands(
             &mut swarm,
@@ -217,6 +215,21 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                 }
 
+                // Reschedule reconnect when async dial to bootstrap peer fails
+                if let SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), .. } = &event
+                    && bootstrap_peer_ids.contains(peer_id)
+                    && !swarm.is_connected(peer_id)
+                    && !pending_reconnects.contains_key(peer_id)
+                    && let Some((_, delay)) = backoff.schedule_reconnect(*peer_id)
+                {
+                    pending_reconnects.insert(*peer_id, tokio::time::Instant::now() + delay);
+                    tracing::info!(
+                        %peer_id,
+                        delay_secs = delay.as_secs(),
+                        "rescheduling bootstrap reconnect after failed dial"
+                    );
+                }
+
                 // Auto-confirm external address candidates discovered via Identify/AutoNAT
                 if let SwarmEvent::NewExternalAddrCandidate { address } = &event {
                     swarm.add_external_address(address.clone());
@@ -234,13 +247,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     && step.last
                     && let Some(target_peer) = kad_tunnel_queries.remove(id)
                 {
-                    if swarm.is_connected(&target_peer) {
-                        if let Some(specs) = pending_tunnels.remove(&target_peer) {
-                            tracing::info!(%target_peer, "tunnel target already connected, spawning tunnels");
-                            spawn_tunnels(&specs, target_peer, &stream_control, &mut tunnel_registry);
+                    match swarm.is_connected(&target_peer) {
+                        true => {
+                            if let Some(specs) = pending_tunnels.remove(&target_peer) {
+                                tracing::info!(%target_peer, "tunnel target already connected, spawning tunnels");
+                                spawn_tunnels(&specs, target_peer, &stream_control, &mut tunnel_registry);
+                            }
                         }
-                    } else {
-                        match swarm.dial(target_peer) {
+                        false => match swarm.dial(target_peer) {
                             Ok(()) => {
                                 tunnel_peers_dialing.insert(target_peer);
                                 tracing::info!(%target_peer, "dialing tunnel target after DHT lookup");
@@ -249,7 +263,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 tracing::error!(%target_peer, error = %e, "failed to dial tunnel target");
                                 pending_tunnels.remove(&target_peer);
                             }
-                        }
+                        },
                     }
                 }
 
@@ -274,24 +288,27 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                     .map(|addr| (service_name.clone(), addr))
                                     .collect();
 
-                                if swarm.is_connected(first_provider) {
-                                    tracing::info!(
-                                        %service_name, %first_provider,
-                                        "service provider already connected, spawning tunnels"
-                                    );
-                                    spawn_tunnels(&specs, *first_provider, &stream_control, &mut tunnel_registry);
-                                } else {
-                                    pending_tunnels
-                                        .entry(*first_provider)
-                                        .or_default()
-                                        .extend(specs);
-                                    let query_id = swarm.behaviour_mut().kademlia
-                                        .get_closest_peers(*first_provider);
-                                    kad_tunnel_queries.insert(query_id, *first_provider);
-                                    tracing::info!(
-                                        %service_name, %first_provider,
-                                        "service provider discovered, initiating connection"
-                                    );
+                                match swarm.is_connected(first_provider) {
+                                    true => {
+                                        tracing::info!(
+                                            %service_name, %first_provider,
+                                            "service provider already connected, spawning tunnels"
+                                        );
+                                        spawn_tunnels(&specs, *first_provider, &stream_control, &mut tunnel_registry);
+                                    }
+                                    false => {
+                                        pending_tunnels
+                                            .entry(*first_provider)
+                                            .or_default()
+                                            .extend(specs);
+                                        let query_id = swarm.behaviour_mut().kademlia
+                                            .get_closest_peers(*first_provider);
+                                        kad_tunnel_queries.insert(query_id, *first_provider);
+                                        tracing::info!(
+                                            %service_name, %first_provider,
+                                            "service provider discovered, initiating connection"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -316,10 +333,15 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     && pending_tunnels.contains_key(peer_id)
                 {
                     tunnel_peers_dialing.remove(peer_id);
-                    if is_relayed(endpoint) {
-                        tracing::info!(%peer_id, "connected to tunnel target via relay, waiting for DCUtR hole punch");
-                    } else if let Some(specs) = pending_tunnels.remove(peer_id) {
-                        spawn_tunnels(&specs, *peer_id, &stream_control, &mut tunnel_registry);
+                    match is_relayed(endpoint) {
+                        true => {
+                            tracing::info!(%peer_id, "connected to tunnel target via relay, waiting for DCUtR hole punch");
+                        }
+                        false => {
+                            if let Some(specs) = pending_tunnels.remove(peer_id) {
+                                spawn_tunnels(&specs, *peer_id, &stream_control, &mut tunnel_registry);
+                            }
+                        }
                     }
                 }
 
@@ -328,30 +350,26 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     &bootstrap_peer_ids,
                     active_bootstrap_query,
                 ) {
-                    if let Event::HolePunchSucceeded { remote_peer } = &state_event {
-                        if let Some(specs) = pending_tunnels.remove(remote_peer) {
-                            tracing::info!(%remote_peer, "hole punch succeeded, spawning tunnel");
-                            spawn_tunnels(&specs, *remote_peer, &stream_control, &mut tunnel_registry);
+                    match &state_event {
+                        Event::HolePunchSucceeded { remote_peer } => {
+                            if let Some(specs) = pending_tunnels.remove(remote_peer) {
+                                tracing::info!(%remote_peer, "hole punch succeeded, spawning tunnel");
+                                spawn_tunnels(&specs, *remote_peer, &stream_control, &mut tunnel_registry);
+                            }
                         }
-                    } else if let Event::HolePunchFailed { remote_peer, reason } = &state_event
-                        && pending_tunnels.remove(remote_peer).is_some()
-                    {
-                        tracing::error!(%remote_peer, %reason, "hole punch failed — tunnel cannot be established (direct connection required)");
+                        Event::HolePunchFailed { remote_peer, reason } => {
+                            if pending_tunnels.remove(remote_peer).is_some() {
+                                tracing::error!(%remote_peer, %reason, "hole punch failed — tunnel cannot be established (direct connection required)");
+                            }
+                        }
+                        _ => {}
                     }
 
                     let old_phase = peer_state.phase;
                     let event_label = event_name(&state_event);
                     let (new_state, commands) = peer_state.transition(state_event);
                     tracing::debug!(event = event_label, commands = commands.len(), "event processed");
-                    if old_phase != new_state.phase {
-                        tracing::info!(
-                            event = event_label,
-                            from = phase_name(old_phase),
-                            to = phase_name(new_state.phase),
-                            commands = commands.len(),
-                            "phase transition"
-                        );
-                    }
+                    log_phase_transition(event_label, old_phase, new_state.phase, commands.len());
                     peer_state = new_state;
                     execute_commands(
                         &mut swarm,
@@ -361,14 +379,17 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
 
                     // Initiate DHT lookups when transitioning to Participating
-                    if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
+                    if let (Phase::Initializing | Phase::Discovering | Phase::ShuttingDown, Phase::Participating) = (old_phase, peer_state.phase) {
                         initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
                         initiate_service_lookups(&mut swarm, &pending_service_tunnels, &mut kad_service_queries);
                     }
 
-                    if peer_state.phase == Phase::ShuttingDown {
-                        tracing::info!("shutting down");
-                        break;
+                    match peer_state.phase {
+                        Phase::ShuttingDown => {
+                            tracing::info!("shutting down");
+                            break;
+                        }
+                        Phase::Initializing | Phase::Discovering | Phase::Participating => {}
                     }
                 }
             }
@@ -377,19 +398,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 let old_phase = peer_state.phase;
                 let (new_state, commands) = peer_state.transition(Event::DiscoveryTimeout);
                 tracing::debug!(event = "DiscoveryTimeout", commands = commands.len(), "event processed");
-                if old_phase != new_state.phase {
-                    tracing::info!(
-                        event = "DiscoveryTimeout",
-                        from = phase_name(old_phase),
-                        to = phase_name(new_state.phase),
-                        commands = commands.len(),
-                        "phase transition"
-                    );
-                }
+                log_phase_transition("DiscoveryTimeout", old_phase, new_state.phase, commands.len());
                 peer_state = new_state;
                 execute_commands(&mut swarm, &commands, &config.exposed, &mut active_bootstrap_query);
 
-                if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
+                if let (Phase::Initializing | Phase::Discovering | Phase::ShuttingDown, Phase::Participating) = (old_phase, peer_state.phase) {
                     initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
                     initiate_service_lookups(&mut swarm, &pending_service_tunnels, &mut kad_service_queries);
                 }
@@ -398,11 +411,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 publish_services(&mut swarm, &config.exposed);
             }
             _ = async {
-                if let Some(deadline) = next_reconnect {
-                    tokio::time::sleep_until(deadline).await;
-                } else {
+                match next_reconnect {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
                     // No pending reconnects — sleep forever (will be cancelled)
-                    std::future::pending::<()>().await;
+                    None => std::future::pending::<()>().await,
                 }
             } => {
                 // Fire all due reconnects
@@ -417,14 +429,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     pending_reconnects.remove(&peer_id);
                     if let Some(addr) = backoff.addrs.get(&peer_id) {
                         tracing::info!(%peer_id, %addr, "attempting bootstrap reconnect");
-                        if let Err(e) = swarm.dial(addr.clone()) {
-                            tracing::warn!(%peer_id, error = %e, "reconnect dial failed");
-                            // Schedule another attempt
-                            if let Some((_, delay)) = backoff.schedule_reconnect(peer_id) {
-                                pending_reconnects.insert(
-                                    peer_id,
-                                    tokio::time::Instant::now() + delay,
-                                );
+                        match swarm.dial(addr.clone()) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                tracing::warn!(%peer_id, error = %e, "reconnect dial failed");
+                                if let Some((_, delay)) = backoff.schedule_reconnect(peer_id) {
+                                    pending_reconnects.insert(
+                                        peer_id,
+                                        tokio::time::Instant::now() + delay,
+                                    );
+                                }
                             }
                         }
                     }
@@ -434,20 +448,15 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 let old_phase = peer_state.phase;
                 let (new_state, commands) = peer_state.transition(Event::ShutdownRequested);
                 tracing::debug!(event = "ShutdownRequested", commands = commands.len(), "event processed");
-                if old_phase != new_state.phase {
-                    tracing::info!(
-                        event = "ShutdownRequested",
-                        from = phase_name(old_phase),
-                        to = phase_name(new_state.phase),
-                        commands = commands.len(),
-                        "phase transition"
-                    );
-                }
+                log_phase_transition("ShutdownRequested", old_phase, new_state.phase, commands.len());
                 peer_state = new_state;
                 execute_commands(&mut swarm, &commands, &config.exposed, &mut active_bootstrap_query);
-                if peer_state.phase == Phase::ShuttingDown {
-                    tracing::info!("shutting down");
-                    break;
+                match peer_state.phase {
+                    Phase::ShuttingDown => {
+                        tracing::info!("shutting down");
+                        break;
+                    }
+                    Phase::Initializing | Phase::Discovering | Phase::Participating => {}
                 }
             }
         }
@@ -472,16 +481,13 @@ fn translate_swarm_event(
 
         SwarmEvent::ConnectionEstablished {
             peer_id, endpoint, ..
-        } => {
-            if bootstrap_peers.contains(peer_id) {
-                Some(Event::BootstrapConnected {
-                    peer: *peer_id,
-                    addr: endpoint.get_remote_address().clone(),
-                })
-            } else {
-                None
-            }
-        }
+        } => match bootstrap_peers.contains(peer_id) {
+            true => Some(Event::BootstrapConnected {
+                peer: *peer_id,
+                addr: endpoint.get_remote_address().clone(),
+            }),
+            false => None,
+        },
 
         SwarmEvent::ConnectionClosed {
             peer_id,
@@ -537,10 +543,12 @@ fn translate_behaviour_event(
         BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
             id,
             result: kad::QueryResult::Bootstrap(result),
+            step,
             ..
         }) => {
-            if active_bootstrap_query != Some(*id) {
-                return None;
+            match is_active_bootstrap_result(*id, active_bootstrap_query, step.last) {
+                true => {}
+                false => return None,
             }
             match result {
                 Ok(_) => Some(Event::KademliaBootstrapOk),
@@ -624,16 +632,14 @@ fn execute_commands(
 ) {
     for cmd in commands {
         match cmd {
-            Command::Dial(addr) => {
-                if let Err(e) = swarm.dial(addr.clone()) {
-                    tracing::warn!(%addr, error = %e, "dial failed");
-                }
-            }
-            Command::Listen(addr) => {
-                if let Err(e) = swarm.listen_on(addr.clone()) {
-                    tracing::warn!(%addr, error = %e, "listen failed");
-                }
-            }
+            Command::Dial(addr) => match swarm.dial(addr.clone()) {
+                Ok(()) => {}
+                Err(e) => tracing::warn!(%addr, error = %e, "dial failed"),
+            },
+            Command::Listen(addr) => match swarm.listen_on(addr.clone()) {
+                Ok(_) => {}
+                Err(e) => tracing::warn!(%addr, error = %e, "listen failed"),
+            },
             Command::KademliaBootstrap => match swarm.behaviour_mut().kademlia.bootstrap() {
                 Ok(query_id) => *active_bootstrap_query = Some(query_id),
                 Err(e) => {
@@ -649,8 +655,9 @@ fn execute_commands(
             }
             Command::KademliaStartProviding { key } => {
                 let key = kad::RecordKey::new(key);
-                if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(key) {
-                    tracing::warn!(error = %e, "start_providing failed");
+                match swarm.behaviour_mut().kademlia.start_providing(key) {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "start_providing failed"),
                 }
             }
             Command::KademliaGetProviders { key } => {
@@ -659,12 +666,13 @@ fn execute_commands(
             }
             Command::KademliaPutRecord { key, value } => {
                 let record = kad::Record::new(key.clone(), value.clone());
-                if let Err(e) = swarm
+                match swarm
                     .behaviour_mut()
                     .kademlia
                     .put_record(record, kad::Quorum::One)
                 {
-                    tracing::warn!(error = %e, "put_record failed");
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "put_record failed"),
                 }
             }
             Command::RequestRelayReservation {
@@ -681,8 +689,9 @@ fn execute_commands(
                 base.push(libp2p::multiaddr::Protocol::P2p(*relay_peer));
                 base.push(libp2p::multiaddr::Protocol::P2pCircuit);
                 tracing::info!(%base, "requesting relay reservation");
-                if let Err(e) = swarm.listen_on(base) {
-                    tracing::warn!(error = %e, "relay reservation listen failed");
+                match swarm.listen_on(base) {
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "relay reservation listen failed"),
                 }
             }
             Command::AddExternalAddress(addr) => {
@@ -705,8 +714,9 @@ fn publish_services(swarm: &mut libp2p::Swarm<Behaviour>, exposed: &[ExposedServ
     for svc in exposed {
         let key = service::service_key(&svc.name);
         let record_key = kad::RecordKey::new(&key);
-        if let Err(e) = swarm.behaviour_mut().kademlia.start_providing(record_key) {
-            tracing::warn!(service = %svc.name, error = %e, "start_providing failed");
+        match swarm.behaviour_mut().kademlia.start_providing(record_key) {
+            Ok(_) => {}
+            Err(e) => tracing::warn!(service = %svc.name, error = %e, "start_providing failed"),
         }
 
         let metadata = match serde_json::to_vec(&svc.name) {
@@ -717,12 +727,13 @@ fn publish_services(swarm: &mut libp2p::Swarm<Behaviour>, exposed: &[ExposedServ
             }
         };
         let record = kad::Record::new(key, metadata);
-        if let Err(e) = swarm
+        match swarm
             .behaviour_mut()
             .kademlia
             .put_record(record, kad::Quorum::One)
         {
-            tracing::warn!(service = %svc.name, error = %e, "put_record failed");
+            Ok(_) => {}
+            Err(e) => tracing::warn!(service = %svc.name, error = %e, "put_record failed"),
         }
     }
 }
@@ -750,8 +761,9 @@ fn spawn_tunnels(
         let addr = bind_addr.clone();
         let label = format!("{remote_peer}:{svc}@{addr}");
         let handle = tokio::spawn(async move {
-            if let Err(e) = tunnel::connect_tunnel(control, remote_peer, svc, addr).await {
-                tracing::error!(error = %e, "tunnel failed");
+            match tunnel::connect_tunnel(control, remote_peer, svc, addr).await {
+                Ok(()) => {}
+                Err(e) => tracing::error!(error = %e, "tunnel failed"),
             }
         });
         registry.register(label, handle);
@@ -788,12 +800,9 @@ fn initiate_service_lookups(
 }
 
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
-    addr.iter().find_map(|proto| {
-        if let libp2p::multiaddr::Protocol::P2p(peer_id) = proto {
-            Some(peer_id)
-        } else {
-            None
-        }
+    addr.iter().find_map(|proto| match proto {
+        libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
     })
 }
 
@@ -828,5 +837,236 @@ fn phase_name(phase: Phase) -> &'static str {
         Phase::Discovering => "Discovering",
         Phase::Participating => "Participating",
         Phase::ShuttingDown => "ShuttingDown",
+    }
+}
+
+fn log_phase_transition(event: &str, old: Phase, new: Phase, commands: usize) {
+    match (old, new) {
+        (o, n) if o != n => {
+            tracing::info!(
+                event,
+                from = phase_name(o),
+                to = phase_name(n),
+                commands,
+                "phase transition"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Predicate extracted from `translate_behaviour_event`: accepts a Kademlia
+/// bootstrap result only when it matches the currently-tracked query and
+/// is the final step.
+fn is_active_bootstrap_result(
+    event_id: kad::QueryId,
+    active: Option<kad::QueryId>,
+    step_last: bool,
+) -> bool {
+    active == Some(event_id) && step_last
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    // ─── Generators (shared with state.rs tests) ─────────────────────────
+
+    fn arb_peer_id() -> impl Strategy<Value = PeerId> {
+        any::<[u8; 32]>().prop_map(|bytes| {
+            // Infallible: any 32 bytes is a valid ed25519 seed
+            let secret = libp2p::identity::ed25519::SecretKey::try_from_bytes(bytes)
+                .expect("any 32 bytes is a valid ed25519 seed");
+            let ed_kp = libp2p::identity::ed25519::Keypair::from(secret);
+            let keypair = libp2p::identity::Keypair::from(ed_kp);
+            PeerId::from(keypair.public())
+        })
+    }
+
+    fn arb_multiaddr() -> impl Strategy<Value = Multiaddr> {
+        (
+            1u8..=254,
+            0u8..=255,
+            0u8..=255,
+            1u8..=254,
+            1024u16..65535u16,
+        )
+            .prop_map(|(a, b, c, d, port)| {
+                // Infallible: formatted string is always a valid multiaddr
+                format!("/ip4/{a}.{b}.{c}.{d}/tcp/{port}")
+                    .parse()
+                    .expect("generated IP4/TCP multiaddr is always valid")
+            })
+    }
+
+    // ─── Suite 1: ReconnectBackoff property tests ────────────────────────
+
+    proptest! {
+        #[test]
+        fn first_call_returns_initial(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut backoff = ReconnectBackoff::new(&[(peer, addr.clone())]);
+            let result = backoff.schedule_reconnect(peer);
+            let (returned_addr, delay) = result.expect("known peer returns Some");
+            prop_assert_eq!(returned_addr, addr);
+            prop_assert_eq!(delay, BACKOFF_INITIAL);
+        }
+
+        #[test]
+        fn exponential_growth_sequence(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+            n in 0usize..10,
+        ) {
+            let mut backoff = ReconnectBackoff::new(&[(peer, addr)]);
+            for k in 0..=n {
+                let (_, delay) = backoff.schedule_reconnect(peer)
+                    .expect("known peer returns Some");
+                // step k returns min(BACKOFF_INITIAL * 2^k, BACKOFF_MAX)
+                let expected = BACKOFF_INITIAL.saturating_mul(1u32.checked_shl(u32::try_from(k)
+                    .expect("k < 10 fits in u32")).unwrap_or(u32::MAX)).min(BACKOFF_MAX);
+                prop_assert_eq!(delay, expected, "mismatch at step {}", k);
+            }
+        }
+
+        #[test]
+        fn delay_never_exceeds_max(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+            n in 1usize..20,
+        ) {
+            let mut backoff = ReconnectBackoff::new(&[(peer, addr)]);
+            for _ in 0..n {
+                let (_, delay) = backoff.schedule_reconnect(peer)
+                    .expect("known peer returns Some");
+                prop_assert!(delay <= BACKOFF_MAX, "delay {} exceeded max {}", delay.as_secs(), BACKOFF_MAX.as_secs());
+            }
+        }
+
+        #[test]
+        fn cap_is_stable(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut backoff = ReconnectBackoff::new(&[(peer, addr)]);
+            // Advance past the cap (2^6 = 64 > 60)
+            for _ in 0..10 {
+                backoff.schedule_reconnect(peer);
+            }
+            // All subsequent calls should return BACKOFF_MAX
+            for _ in 0..5 {
+                let (_, delay) = backoff.schedule_reconnect(peer)
+                    .expect("known peer returns Some");
+                prop_assert_eq!(delay, BACKOFF_MAX);
+            }
+        }
+
+        #[test]
+        fn reset_clears_delay(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+            n in 1usize..10,
+        ) {
+            let mut backoff = ReconnectBackoff::new(&[(peer, addr)]);
+            for _ in 0..n {
+                backoff.schedule_reconnect(peer);
+            }
+            backoff.reset(&peer);
+            let (_, delay) = backoff.schedule_reconnect(peer)
+                .expect("known peer returns Some after reset");
+            prop_assert_eq!(delay, BACKOFF_INITIAL);
+        }
+
+        #[test]
+        fn unknown_peer_returns_none(
+            known_peer in arb_peer_id(),
+            unknown_peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            prop_assume!(known_peer != unknown_peer);
+            let mut backoff = ReconnectBackoff::new(&[(known_peer, addr)]);
+            let result = backoff.schedule_reconnect(unknown_peer);
+            prop_assert!(result.is_none());
+        }
+
+        #[test]
+        fn independent_peer_delays(
+            peer_a in arb_peer_id(),
+            peer_b in arb_peer_id(),
+            addr_a in arb_multiaddr(),
+            addr_b in arb_multiaddr(),
+        ) {
+            prop_assume!(peer_a != peer_b);
+            let mut backoff = ReconnectBackoff::new(&[(peer_a, addr_a), (peer_b, addr_b)]);
+
+            // Advance peer_a 5 times
+            for _ in 0..5 {
+                backoff.schedule_reconnect(peer_a);
+            }
+
+            // peer_b should still return initial
+            let (_, delay_b) = backoff.schedule_reconnect(peer_b)
+                .expect("peer_b known");
+            prop_assert_eq!(delay_b, BACKOFF_INITIAL);
+        }
+    }
+
+    // ─── Suite 2: Bootstrap QueryId filtering ────────────────────────────
+
+    fn make_query_ids() -> (kad::QueryId, kad::QueryId) {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer = PeerId::from(keypair.public());
+        let kad_config = kad::Config::new(crate::protocol::kad_protocol());
+        let store = kad::store::MemoryStore::new(local_peer);
+        let mut kademlia = kad::Behaviour::with_config(local_peer, store, kad_config);
+
+        // Add a fake peer so bootstrap() has someone to query
+        let fake_peer = PeerId::random();
+        let fake_addr: Multiaddr = "/ip4/1.2.3.4/tcp/5678"
+            .parse()
+            .expect("static multiaddr is always valid");
+        kademlia.add_address(&fake_peer, fake_addr);
+
+        let qid1 = kademlia
+            .bootstrap()
+            .expect("bootstrap with known peer succeeds");
+        let qid2 = kademlia.get_closest_peers(PeerId::random());
+        (qid1, qid2)
+    }
+
+    #[test]
+    fn matching_id_last_step_accepted() {
+        let (qid, _) = make_query_ids();
+        assert!(is_active_bootstrap_result(qid, Some(qid), true));
+    }
+
+    #[test]
+    fn non_matching_id_rejected() {
+        let (qid, other) = make_query_ids();
+        assert!(!is_active_bootstrap_result(other, Some(qid), true));
+    }
+
+    #[test]
+    fn intermediate_step_rejected() {
+        let (qid, _) = make_query_ids();
+        assert!(!is_active_bootstrap_result(qid, Some(qid), false));
+    }
+
+    #[test]
+    fn no_active_query_rejected() {
+        let (qid, _) = make_query_ids();
+        assert!(!is_active_bootstrap_result(qid, None, true));
+    }
+
+    #[test]
+    fn both_none_and_not_last_rejected() {
+        let (qid, _) = make_query_ids();
+        assert!(!is_active_bootstrap_result(qid, None, false));
     }
 }

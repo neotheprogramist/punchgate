@@ -225,8 +225,9 @@ impl PeerState {
         match event {
             Event::ListeningOn { addr } => {
                 commands.push(Command::Log(format!("listening on {addr}")));
-                if !is_loopback_addr(&addr) {
-                    commands.push(Command::AddExternalAddress(addr));
+                match is_loopback_addr(&addr) {
+                    true => {}
+                    false => commands.push(Command::AddExternalAddress(addr)),
                 }
             }
 
@@ -282,23 +283,28 @@ impl PeerState {
                     "NAT status changed: {old:?} → {status:?}"
                 )));
 
-                if let (NatStatus::Public, RelayState::Reserved { .. }) = (status, &self.relay) {
-                    self.relay = RelayState::Idle;
-                    commands.push(Command::Log(
-                        "publicly reachable, releasing relay reservation".into(),
-                    ));
+                match (status, &self.relay) {
+                    (NatStatus::Public, RelayState::Reserved { .. }) => {
+                        self.relay = RelayState::Idle;
+                        commands.push(Command::Log(
+                            "publicly reachable, releasing relay reservation".into(),
+                        ));
+                    }
+                    (NatStatus::Public, RelayState::Idle | RelayState::Requesting { .. })
+                    | (NatStatus::Private | NatStatus::Unknown, _) => {}
                 }
             }
 
-            Event::DiscoveryTimeout => {
-                if self.phase == Phase::Discovering {
+            Event::DiscoveryTimeout => match self.phase {
+                Phase::Discovering => {
                     self.phase = Phase::Participating;
                     commands.push(Command::PublishServices);
                     commands.push(Command::Log(
                         "discovery timeout, entering participation".into(),
                     ));
                 }
-            }
+                Phase::Initializing | Phase::Participating | Phase::ShuttingDown => {}
+            },
 
             Event::MdnsDiscovered { peers } => {
                 for (peer, addr) in peers {
@@ -312,11 +318,12 @@ impl PeerState {
 
             Event::MdnsExpired { peers } => {
                 for (peer, addr) in peers {
-                    if let Some(addrs) = self.known_peers.get_mut(&peer) {
+                    let now_empty = self.known_peers.get_mut(&peer).map(|addrs| {
                         addrs.remove(&addr);
-                        if addrs.is_empty() {
-                            self.known_peers.remove(&peer);
-                        }
+                        addrs.is_empty()
+                    });
+                    if let Some(true) = now_empty {
+                        self.known_peers.remove(&peer);
                     }
                 }
             }
@@ -341,8 +348,13 @@ impl PeerState {
             }
 
             Event::RelayReservationFailed { relay_peer, reason } => {
-                if self.relay == (RelayState::Requesting { relay_peer }) {
-                    self.relay = RelayState::Idle;
+                match &self.relay {
+                    RelayState::Requesting { relay_peer: rp } if *rp == relay_peer => {
+                        self.relay = RelayState::Idle;
+                    }
+                    RelayState::Requesting { .. }
+                    | RelayState::Idle
+                    | RelayState::Reserved { .. } => {}
                 }
                 commands.push(Command::Log(format!(
                     "relay reservation with {relay_peer} failed: {reason}"
@@ -382,14 +394,23 @@ impl PeerState {
                                 "relay peer disconnected, resetting relay state".into(),
                             ));
                         }
-                        _ => {}
+                        RelayState::Requesting { .. }
+                        | RelayState::Reserved { .. }
+                        | RelayState::Idle => {}
                     }
 
-                    if self.phase == Phase::Participating && self.known_peers.is_empty() {
-                        self.phase = Phase::Discovering;
-                        self.kad_bootstrapped = false;
-                        commands.push(Command::KademliaBootstrap);
-                        commands.push(Command::Log("all peers lost, re-entering discovery".into()));
+                    match (self.phase, self.known_peers.is_empty()) {
+                        (Phase::Participating, true) => {
+                            self.phase = Phase::Discovering;
+                            self.kad_bootstrapped = false;
+                            commands.push(Command::KademliaBootstrap);
+                            commands
+                                .push(Command::Log("all peers lost, re-entering discovery".into()));
+                        }
+                        (Phase::Participating, false)
+                        | (Phase::Initializing, _)
+                        | (Phase::Discovering, _)
+                        | (Phase::ShuttingDown, _) => {}
                     }
                 }
             }
@@ -413,15 +434,16 @@ impl PeerState {
                 )));
             }
 
-            Event::NoBootstrapPeers => {
-                if self.phase == Phase::Initializing {
+            Event::NoBootstrapPeers => match self.phase {
+                Phase::Initializing => {
                     self.phase = Phase::Participating;
                     commands.push(Command::PublishServices);
                     commands.push(Command::Log(
                         "no bootstrap peers configured, entering participation directly".into(),
                     ));
                 }
-            }
+                Phase::Discovering | Phase::Participating | Phase::ShuttingDown => {}
+            },
 
             Event::ExternalAddrConfirmed { addr } => {
                 self.external_addrs.insert(addr.clone());
@@ -448,27 +470,41 @@ impl PeerState {
     /// Unconditionally requests relay reservation from the nearest bootstrap peer.
     fn maybe_enter_participating(mut self) -> (Self, Vec<Command>) {
         let mut commands = Vec::new();
-        if self.phase == Phase::Discovering && self.kad_bootstrapped && !self.known_peers.is_empty()
-        {
-            self.phase = Phase::Participating;
-            commands.push(Command::PublishServices);
-            commands.push(Command::Log(
-                "discovery complete, entering participation".into(),
-            ));
+        match (
+            self.phase,
+            self.kad_bootstrapped,
+            self.known_peers.is_empty(),
+        ) {
+            (Phase::Discovering, true, false) => {
+                self.phase = Phase::Participating;
+                commands.push(Command::PublishServices);
+                commands.push(Command::Log(
+                    "discovery complete, entering participation".into(),
+                ));
 
-            if self.relay == RelayState::Idle
-                && let Some((&relay_peer, addrs)) = self
-                    .known_peers
-                    .iter()
-                    .find(|(p, _)| self.bootstrap_peers.contains(p))
-                && let Some(addr) = prefer_non_loopback(addrs)
-            {
-                self.relay = RelayState::Requesting { relay_peer };
-                commands.push(Command::RequestRelayReservation {
-                    relay_peer,
-                    relay_addr: addr.clone(),
-                });
+                let relay_candidate = match &self.relay {
+                    RelayState::Idle => self
+                        .known_peers
+                        .iter()
+                        .find(|(p, _)| self.bootstrap_peers.contains(p))
+                        .and_then(|(&peer, addrs)| {
+                            prefer_non_loopback(addrs).map(|addr| (peer, addr.clone()))
+                        }),
+                    RelayState::Requesting { .. } | RelayState::Reserved { .. } => None,
+                };
+
+                if let Some((relay_peer, relay_addr)) = relay_candidate {
+                    self.relay = RelayState::Requesting { relay_peer };
+                    commands.push(Command::RequestRelayReservation {
+                        relay_peer,
+                        relay_addr,
+                    });
+                }
             }
+            (Phase::Discovering, ..)
+            | (Phase::Initializing, ..)
+            | (Phase::Participating, ..)
+            | (Phase::ShuttingDown, ..) => {}
         }
         (self, commands)
     }
@@ -728,15 +764,18 @@ mod tests {
                 peers: vec![(peer, addr1.clone())],
             });
 
-            if addr1 == addr2 {
-                prop_assert!(!state.known_peers.contains_key(&peer));
-            } else {
-                prop_assert!(state.known_peers.contains_key(&peer));
+            match addr1 == addr2 {
+                true => {
+                    prop_assert!(!state.known_peers.contains_key(&peer));
+                }
+                false => {
+                    prop_assert!(state.known_peers.contains_key(&peer));
 
-                let (state, _) = state.transition(Event::MdnsExpired {
-                    peers: vec![(peer, addr2)],
-                });
-                prop_assert!(!state.known_peers.contains_key(&peer));
+                    let (state, _) = state.transition(Event::MdnsExpired {
+                        peers: vec![(peer, addr2)],
+                    });
+                    prop_assert!(!state.known_peers.contains_key(&peer));
+                }
             }
         }
 
@@ -747,11 +786,14 @@ mod tests {
             state.phase = phase;
 
             let (new_state, commands) = state.transition(Event::NoBootstrapPeers);
-            if phase == Phase::Initializing {
-                prop_assert_eq!(new_state.phase, Phase::Participating);
-                prop_assert!(commands.contains(&Command::PublishServices));
-            } else {
-                prop_assert_eq!(new_state.phase, phase);
+            match phase {
+                Phase::Initializing => {
+                    prop_assert_eq!(new_state.phase, Phase::Participating);
+                    prop_assert!(commands.contains(&Command::PublishServices));
+                }
+                Phase::Discovering | Phase::Participating | Phase::ShuttingDown => {
+                    prop_assert_eq!(new_state.phase, phase);
+                }
             }
         }
 

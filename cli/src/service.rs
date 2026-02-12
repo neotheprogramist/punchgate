@@ -27,16 +27,17 @@ impl FromStr for ServiceAddr {
     type Err = ServiceAddrParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (host, port_str) = if s.starts_with('[') {
+        let (host, port_str) = match s.strip_prefix('[') {
             // IPv6 bracket notation: [::1]:8080
-            let (bracket_host, rest) = s
-                .split_once("]:")
-                .ok_or(ServiceAddrParseError::MissingPort)?;
-            // Infallible: starts_with('[') guarantees at least one byte to skip
-            (&bracket_host[1..], rest)
-        } else {
-            s.rsplit_once(':')
-                .ok_or(ServiceAddrParseError::MissingPort)?
+            Some(after_bracket) => {
+                let (bracket_host, rest) = after_bracket
+                    .split_once("]:")
+                    .ok_or(ServiceAddrParseError::MissingPort)?;
+                (bracket_host, rest)
+            }
+            None => s
+                .rsplit_once(':')
+                .ok_or(ServiceAddrParseError::MissingPort)?,
         };
 
         if host.is_empty() {
@@ -54,10 +55,9 @@ impl FromStr for ServiceAddr {
 
 impl fmt::Display for ServiceAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
+        match self.host.contains(':') {
+            true => write!(f, "[{}]:{}", self.host, self.port),
+            false => write!(f, "{}:{}", self.host, self.port),
         }
     }
 }

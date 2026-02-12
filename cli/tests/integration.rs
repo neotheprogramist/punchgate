@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use futures::StreamExt;
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
-use libp2p::{PeerId, SwarmBuilder, identify, kad, noise, swarm::SwarmEvent, yamux};
+use libp2p::{
+    Multiaddr, PeerId, SwarmBuilder, identify, identity::Keypair, kad, noise, swarm::SwarmEvent,
+    yamux,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -65,6 +68,71 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
         .expect("start listening");
 
     (swarm, peer_id, control)
+}
+
+fn build_test_swarm_with_keypair(
+    keypair: Keypair,
+) -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::Control) {
+    let peer_id = PeerId::from(keypair.public());
+
+    let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
+        .with_tokio()
+        .with_tcp(
+            Default::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .expect("build TCP transport")
+        .with_behaviour(|key| {
+            let peer_id = PeerId::from(key.public());
+
+            let kad_config = kad::Config::new(cli::protocol::kad_protocol());
+            let store = kad::store::MemoryStore::new(peer_id);
+            let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
+            kademlia.set_mode(Some(kad::Mode::Server));
+
+            #[cfg(feature = "mdns")]
+            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                .expect("create mDNS behaviour");
+
+            let identify = identify::Behaviour::new(identify::Config::new(
+                cli::protocol::IDENTIFY_PROTOCOL.to_string(),
+                key.public(),
+            ));
+
+            let stream = libp2p_stream::Behaviour::new();
+
+            TestBehaviour {
+                kademlia,
+                #[cfg(feature = "mdns")]
+                mdns,
+                identify,
+                stream,
+            }
+        })
+        .expect("build swarm behaviour")
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build();
+
+    let control = swarm.behaviour().stream.new_control();
+    swarm
+        .listen_on(
+            "/ip4/127.0.0.1/tcp/0"
+                .parse()
+                .expect("parse listen multiaddr"),
+        )
+        .expect("start listening");
+
+    (swarm, peer_id, control)
+}
+
+/// Wait for the first NewListenAddr from a swarm, returning the address.
+async fn wait_for_listen_addr(swarm: &mut libp2p::Swarm<TestBehaviour>) -> Multiaddr {
+    loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            return address;
+        }
+    }
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -656,4 +724,222 @@ async fn three_peer_tunnel() {
     handle_b.abort();
     handle_c.abort();
     echo_handle.abort();
+}
+
+// ─── Test 4: Bootstrap disconnect → recovery ─────────────────────────────────
+
+#[tokio::test]
+async fn bootstrap_disconnect_recovery() {
+    // Phase 1: A (bootstrap) and B connect, B bootstraps Kademlia
+    let keypair_a = Keypair::generate_ed25519();
+    let (mut swarm_a, peer_a, _) = build_test_swarm_with_keypair(keypair_a.clone());
+
+    let addr_a = wait_for_listen_addr(&mut swarm_a).await;
+
+    let (mut swarm_b, _peer_b, _) = build_test_swarm();
+
+    swarm_b
+        .behaviour_mut()
+        .kademlia
+        .add_address(&peer_a, addr_a.clone());
+    swarm_b.dial(addr_a).expect("B dial A");
+
+    // Run A in a task so we can abort it later
+    let handle_a = tokio::spawn(async move {
+        loop {
+            let event = swarm_a.select_next_some().await;
+            if let SwarmEvent::Behaviour(TestBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) = event
+            {
+                for addr in &info.listen_addrs {
+                    swarm_a
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
+                }
+            }
+        }
+    });
+
+    // Wait for B to connect and bootstrap Kademlia
+    let mut bootstrapped = false;
+
+    let bootstrap_result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = swarm_b.select_next_some().await;
+            match event {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_a => {
+                    if !bootstrapped {
+                        let _ = swarm_b.behaviour_mut().kademlia.bootstrap();
+                        bootstrapped = true;
+                    }
+                }
+                SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::Bootstrap(Ok(_)),
+                        step,
+                        ..
+                    },
+                )) if step.last => {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    bootstrap_result.expect("B should bootstrap successfully within timeout");
+
+    // Phase 2: Kill A — B should see ConnectionClosed
+    handle_a.abort();
+
+    let disconnect_result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = swarm_b.select_next_some().await;
+            if let SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established: 0,
+                ..
+            } = event
+                && peer_id == peer_a
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    disconnect_result.expect("B should see A disconnect within timeout");
+
+    // Phase 3: Spawn A2 with SAME keypair (same PeerId) on a new port
+    let (mut swarm_a2, peer_a2, _) = build_test_swarm_with_keypair(keypair_a);
+    assert_eq!(
+        peer_a, peer_a2,
+        "A2 must have the same PeerId as original A"
+    );
+
+    let addr_a2 = wait_for_listen_addr(&mut swarm_a2).await;
+
+    let handle_a2 = tokio::spawn(async move {
+        loop {
+            let event = swarm_a2.select_next_some().await;
+            if let SwarmEvent::Behaviour(TestBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) = event
+            {
+                for addr in &info.listen_addrs {
+                    swarm_a2
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
+                }
+            }
+        }
+    });
+
+    // B dials A2's new address, re-bootstraps, and gets BootstrapOk
+    swarm_b
+        .behaviour_mut()
+        .kademlia
+        .add_address(&peer_a, addr_a2.clone());
+    swarm_b.dial(addr_a2).expect("B dial A2");
+
+    let recovery_result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut reconnected = false;
+        loop {
+            let event = swarm_b.select_next_some().await;
+            match event {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_a => {
+                    reconnected = true;
+                    let _ = swarm_b.behaviour_mut().kademlia.bootstrap();
+                }
+                SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::Bootstrap(Ok(_)),
+                        step,
+                        ..
+                    },
+                )) if step.last && reconnected => {
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+    recovery_result.expect("B should recover and re-bootstrap after A2 comes up");
+
+    handle_a2.abort();
+}
+
+// ─── Test 5: OutgoingConnectionError after peer shutdown ─────────────────────
+
+#[tokio::test]
+async fn outgoing_connection_error_after_peer_shutdown() {
+    // Phase 1: A and B connect successfully
+    let (mut swarm_a, peer_a, _) = build_test_swarm();
+    let (mut swarm_b, _peer_b, _) = build_test_swarm();
+
+    let addr_a = wait_for_listen_addr(&mut swarm_a).await;
+
+    swarm_b.dial(addr_a.clone()).expect("B dial A");
+
+    let handle_a = tokio::spawn(async move {
+        loop {
+            swarm_a.select_next_some().await;
+        }
+    });
+
+    // Wait for B to connect
+    let connect_result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = swarm_b.select_next_some().await;
+            if let SwarmEvent::ConnectionEstablished { peer_id, .. } = event
+                && peer_id == peer_a
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    connect_result.expect("B should connect to A within timeout");
+
+    // Phase 2: Kill A and wait for B to see ConnectionClosed
+    handle_a.abort();
+
+    let closed_result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = swarm_b.select_next_some().await;
+            if let SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established: 0,
+                ..
+            } = event
+                && peer_id == peer_a
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    closed_result.expect("B should see A disconnect within timeout");
+
+    // Phase 3: B dials A's stale address (with peer ID) → OutgoingConnectionError
+    let stale_addr = addr_a.with(libp2p::multiaddr::Protocol::P2p(peer_a));
+    swarm_b.dial(stale_addr).expect("B dial stale A address");
+
+    let error_result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = swarm_b.select_next_some().await;
+            if let SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(pid), ..
+            } = event
+                && pid == peer_a
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    error_result.expect("B should receive OutgoingConnectionError for A's stale address");
 }

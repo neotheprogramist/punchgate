@@ -55,8 +55,9 @@ async fn read_message<T: for<'de> Deserialize<'de>>(
     let len = usize::try_from(u32::from_be_bytes(len_buf))
         .expect("u32 fits in usize on all supported platforms");
     const MAX_MESSAGE_SIZE: usize = 65536;
-    if len > MAX_MESSAGE_SIZE {
-        bail!("message too large: {len} bytes");
+    match len {
+        0..=MAX_MESSAGE_SIZE => {}
+        _ => bail!("message too large: {len} bytes"),
     }
     let mut buf = vec![0u8; len];
     stream.read_exact(&mut buf).await?;
@@ -75,8 +76,9 @@ pub async fn accept_loop(
     while let Some((peer_id, stream)) = incoming.next().await {
         let services = services.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_tunnel(peer_id, stream, &services).await {
-                tracing::warn!(%peer_id, error = %e, "tunnel handler failed");
+            match handle_tunnel(peer_id, stream, &services).await {
+                Ok(()) => {}
+                Err(e) => tracing::warn!(%peer_id, error = %e, "tunnel handler failed"),
             }
         });
     }
@@ -90,17 +92,20 @@ async fn handle_tunnel(
     let request: TunnelRequest = read_message(&mut stream).await?;
     tracing::info!(%peer_id, service = %request.service_name, "tunnel request");
 
-    let Some(local_addr) = services.get(&request.service_name) else {
-        tracing::warn!(%peer_id, service = %request.service_name, reason = "unknown service", "tunnel rejected");
-        write_message(
-            &mut stream,
-            &TunnelResponse {
-                accepted: false,
-                reason: Some(format!("unknown service: {}", request.service_name)),
-            },
-        )
-        .await?;
-        return Ok(());
+    let local_addr = match services.get(&request.service_name) {
+        Some(addr) => addr,
+        None => {
+            tracing::warn!(%peer_id, service = %request.service_name, reason = "unknown service", "tunnel rejected");
+            write_message(
+                &mut stream,
+                &TunnelResponse {
+                    accepted: false,
+                    reason: Some(format!("unknown service: {}", request.service_name)),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     let tcp_stream = TcpStream::connect(local_addr.connect_tuple())
@@ -174,12 +179,13 @@ pub async fn connect_tunnel(
             .with_context(|| format!("opening stream to {remote_peer}"))?;
 
         tokio::spawn(async move {
-            if let Err(e) = client_tunnel_session(&mut stream, tcp_stream, &service_name).await {
-                tracing::warn!(
+            match client_tunnel_session(&mut stream, tcp_stream, &service_name).await {
+                Ok(()) => {}
+                Err(e) => tracing::warn!(
                     %client_addr,
                     error = %e,
                     "tunnel session failed"
-                );
+                ),
             }
         });
     }
@@ -200,10 +206,13 @@ async fn client_tunnel_session(
 
     let response: TunnelResponse = read_message(stream).await?;
 
-    if !response.accepted {
-        let reason = response.reason.as_deref().unwrap_or("unknown");
-        tracing::warn!(service = %service_name, %reason, "client tunnel rejected");
-        bail!("tunnel rejected: {reason}");
+    match response.accepted {
+        true => {}
+        false => {
+            let reason = response.reason.as_deref().unwrap_or("unknown");
+            tracing::warn!(service = %service_name, %reason, "client tunnel rejected");
+            bail!("tunnel rejected: {reason}");
+        }
     }
 
     let mut compat_stream = stream.compat();
@@ -309,11 +318,10 @@ impl TunnelRegistry {
 
     /// Abort all tunnel tasks with a timeout for graceful close.
     pub async fn shutdown_all(&mut self, timeout: Duration) {
-        let count = self.tunnels.len();
-        if count == 0 {
-            return;
+        match self.tunnels.len() {
+            0 => return,
+            count => tracing::info!(count, "shutting down tunnel tasks"),
         }
-        tracing::info!(count, "shutting down tunnel tasks");
 
         for (_, (label, handle)) in self.tunnels.drain() {
             handle.abort();
