@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
@@ -13,7 +13,10 @@ use tokio::{
 };
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::{protocol, service::ServiceAddr};
+use crate::{
+    protocol,
+    service::{ServiceAddr, ServiceAddrParseError},
+};
 
 // ─── Wire format ────────────────────────────────────────────────────────────
 
@@ -146,9 +149,9 @@ pub async fn connect_tunnel(
     mut control: libp2p_stream::Control,
     remote_peer: PeerId,
     service_name: String,
-    bind_addr: SocketAddr,
+    bind_addr: ServiceAddr,
 ) -> Result<()> {
-    let listener = TcpListener::bind(bind_addr)
+    let listener = TcpListener::bind(bind_addr.connect_tuple())
         .await
         .with_context(|| format!("binding to {bind_addr}"))?;
 
@@ -223,7 +226,7 @@ async fn client_tunnel_session(
 pub struct TunnelSpec {
     pub remote_peer: PeerId,
     pub service_name: String,
-    pub bind_addr: SocketAddr,
+    pub bind_addr: ServiceAddr,
 }
 
 #[derive(Debug, Error)]
@@ -235,7 +238,7 @@ pub enum TunnelSpecParseError {
     #[error("invalid peer ID: {0}")]
     InvalidPeerId(String),
     #[error("invalid bind address: {0}")]
-    InvalidBindAddr(#[from] std::net::AddrParseError),
+    InvalidBindAddr(#[from] ServiceAddrParseError),
 }
 
 impl FromStr for TunnelSpec {
@@ -254,7 +257,7 @@ impl FromStr for TunnelSpec {
             .parse()
             .map_err(|e| TunnelSpecParseError::InvalidPeerId(format!("{e}")))?;
 
-        let bind_addr: SocketAddr = bind_str.parse()?;
+        let bind_addr: ServiceAddr = bind_str.parse()?;
 
         Ok(Self {
             remote_peer,
@@ -328,6 +331,8 @@ impl TunnelRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -363,8 +368,16 @@ mod tests {
             })
     }
 
+    fn arb_domain_host() -> impl Strategy<Value = String> {
+        "[a-z][a-z0-9-]{0,9}"
+    }
+
+    fn arb_port() -> impl Strategy<Value = u16> {
+        1024u16..65535u16
+    }
+
     proptest! {
-        // Roundtrip: TunnelSpec FromStr recovers original components
+        // Roundtrip: TunnelSpec FromStr with IP address
         #[test]
         fn tunnel_spec_roundtrip(
             peer_id in arb_peer_id(),
@@ -375,7 +388,24 @@ mod tests {
             let parsed: TunnelSpec = spec.parse().expect("parse generated tunnel spec");
             prop_assert_eq!(parsed.remote_peer, peer_id);
             prop_assert_eq!(parsed.service_name, service);
-            prop_assert_eq!(parsed.bind_addr, addr);
+            prop_assert_eq!(parsed.bind_addr.host, addr.ip().to_string());
+            prop_assert_eq!(parsed.bind_addr.port, addr.port());
+        }
+
+        // Roundtrip: TunnelSpec FromStr with domain name
+        #[test]
+        fn tunnel_spec_domain_roundtrip(
+            peer_id in arb_peer_id(),
+            service in arb_service_name(),
+            host in arb_domain_host(),
+            port in arb_port(),
+        ) {
+            let spec = format!("{peer_id}:{service}@{host}:{port}");
+            let parsed: TunnelSpec = spec.parse().expect("parse generated tunnel spec with domain");
+            prop_assert_eq!(parsed.remote_peer, peer_id);
+            prop_assert_eq!(parsed.service_name, service);
+            prop_assert_eq!(parsed.bind_addr.host, host);
+            prop_assert_eq!(parsed.bind_addr.port, port);
         }
 
         // parse_tunnel_spec wrapper delegates to FromStr
@@ -389,7 +419,8 @@ mod tests {
             let parsed = parse_tunnel_spec(&spec).expect("parse generated tunnel spec");
             prop_assert_eq!(parsed.remote_peer, peer_id);
             prop_assert_eq!(parsed.service_name, service);
-            prop_assert_eq!(parsed.bind_addr, addr);
+            prop_assert_eq!(parsed.bind_addr.host, addr.ip().to_string());
+            prop_assert_eq!(parsed.bind_addr.port, addr.port());
         }
     }
 }

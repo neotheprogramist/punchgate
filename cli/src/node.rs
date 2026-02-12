@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -65,8 +64,6 @@ pub struct NodeConfig {
     pub exposed: Vec<ExposedService>,
     pub tunnel_specs: Vec<TunnelSpec>,
     pub tunnel_by_name_specs: Vec<TunnelByNameSpec>,
-    pub nat_status_override: Option<NatStatus>,
-    pub external_addrs: Vec<Multiaddr>,
 }
 
 /// Run the unified peer node.
@@ -119,33 +116,27 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
     // Build deferred pending tunnels from typed specs (spawned reactively after connection)
     let mut tunnel_registry = TunnelRegistry::new();
-    let mut pending_tunnels: HashMap<PeerId, Vec<(String, SocketAddr)>> = HashMap::new();
+    let mut pending_tunnels: HashMap<PeerId, Vec<(String, ServiceAddr)>> = HashMap::new();
     for spec in &config.tunnel_specs {
         pending_tunnels
             .entry(spec.remote_peer)
             .or_default()
-            .push((spec.service_name.clone(), spec.bind_addr));
+            .push((spec.service_name.clone(), spec.bind_addr.clone()));
     }
 
     let mut kad_tunnel_queries: HashMap<kad::QueryId, PeerId> = HashMap::new();
     let mut tunnel_peers_dialing: HashSet<PeerId> = HashSet::new();
 
     // Pending service-name-based tunnels (not yet resolved to a peer)
-    let mut pending_service_tunnels: HashMap<String, Vec<SocketAddr>> = HashMap::new();
+    let mut pending_service_tunnels: HashMap<String, Vec<ServiceAddr>> = HashMap::new();
     for spec in &config.tunnel_by_name_specs {
         pending_service_tunnels
             .entry(spec.service_name.clone())
             .or_default()
-            .push(spec.bind_addr);
+            .push(spec.bind_addr.clone());
     }
     // Track GetProviders query IDs → service names
     let mut kad_service_queries: HashMap<kad::QueryId, String> = HashMap::new();
-
-    // Register external addresses (needed for relay server to include in reservations)
-    for addr in &config.external_addrs {
-        tracing::info!(%addr, "adding external address");
-        swarm.add_external_address(addr.clone());
-    }
 
     for addr in &config.listen_addrs {
         swarm.listen_on(addr.clone())?;
@@ -161,29 +152,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         peer_state.bootstrap_peers.insert(*peer_id);
     }
 
-    // Apply NAT status override if provided (bypasses AutoNAT wait)
-    if let Some(status) = config.nat_status_override {
-        tracing::info!(?status, "applying --nat-status override");
+    if config.bootstrap_addrs.is_empty() {
         let old_phase = peer_state.phase;
-        let (new_state, commands) = peer_state.transition(Event::NatStatusChanged(status));
+        let (new_state, commands) = peer_state.transition(Event::NoBootstrapPeers);
         if old_phase != new_state.phase {
             tracing::info!(
                 from = phase_name(old_phase),
                 to = phase_name(new_state.phase),
-                "--nat-status triggered phase transition"
+                "no bootstrap peers, entering participation directly"
             );
         }
         peer_state = new_state;
         execute_commands(&mut swarm, &commands, &config.exposed);
-
-        if peer_state.phase == Phase::Participating {
-            initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
-            initiate_service_lookups(
-                &mut swarm,
-                &pending_service_tunnels,
-                &mut kad_service_queries,
-            );
-        }
     }
 
     let discovery_deadline = tokio::time::sleep(DISCOVERY_TIMEOUT);
@@ -229,6 +209,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         delay_secs = delay.as_secs(),
                         "scheduling bootstrap reconnect"
                     );
+                }
+
+                // Auto-confirm external address candidates discovered via Identify/AutoNAT
+                if let SwarmEvent::NewExternalAddrCandidate { address } = &event {
+                    swarm.add_external_address(address.clone());
                 }
 
                 // Handle Kademlia GetClosestPeers results for tunnel target lookups
@@ -278,7 +263,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 && let Some(service_name) = kad_service_queries.remove(id)
                                 && let Some(bind_addrs) = pending_service_tunnels.remove(&service_name)
                             {
-                                let specs: Vec<(String, SocketAddr)> = bind_addrs
+                                let specs: Vec<(String, ServiceAddr)> = bind_addrs
                                     .into_iter()
                                     .map(|addr| (service_name.clone(), addr))
                                     .collect();
@@ -513,13 +498,19 @@ fn translate_swarm_event(
             None
         }
 
+        SwarmEvent::ExternalAddrConfirmed { address } => Some(Event::ExternalAddrConfirmed {
+            addr: address.clone(),
+        }),
+
+        SwarmEvent::ExternalAddrExpired { address } => Some(Event::ExternalAddrExpired {
+            addr: address.clone(),
+        }),
+
         SwarmEvent::IncomingConnection { .. }
         | SwarmEvent::IncomingConnectionError { .. }
         | SwarmEvent::ExpiredListenAddr { .. }
         | SwarmEvent::Dialing { .. }
         | SwarmEvent::NewExternalAddrCandidate { .. }
-        | SwarmEvent::ExternalAddrConfirmed { .. }
-        | SwarmEvent::ExternalAddrExpired { .. }
         | SwarmEvent::NewExternalAddrOfPeer { .. } => None,
 
         // SwarmEvent is #[non_exhaustive] — wildcard required for forward compatibility
@@ -725,7 +716,7 @@ fn is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
 }
 
 fn spawn_tunnels(
-    specs: &[(String, SocketAddr)],
+    specs: &[(String, ServiceAddr)],
     remote_peer: PeerId,
     stream_control: &libp2p_stream::Control,
     registry: &mut TunnelRegistry,
@@ -733,7 +724,7 @@ fn spawn_tunnels(
     for (service_name, bind_addr) in specs {
         let control = stream_control.clone();
         let svc = service_name.clone();
-        let addr = *bind_addr;
+        let addr = bind_addr.clone();
         let label = format!("{remote_peer}:{svc}@{addr}");
         let handle = tokio::spawn(async move {
             if let Err(e) = tunnel::connect_tunnel(control, remote_peer, svc, addr).await {
@@ -746,7 +737,7 @@ fn spawn_tunnels(
 
 fn initiate_tunnel_lookups(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    pending_tunnels: &HashMap<PeerId, Vec<(String, SocketAddr)>>,
+    pending_tunnels: &HashMap<PeerId, Vec<(String, ServiceAddr)>>,
     kad_tunnel_queries: &mut HashMap<kad::QueryId, PeerId>,
 ) {
     for &target_peer in pending_tunnels.keys() {
@@ -761,7 +752,7 @@ fn initiate_tunnel_lookups(
 
 fn initiate_service_lookups(
     swarm: &mut libp2p::Swarm<Behaviour>,
-    pending_service_tunnels: &HashMap<String, Vec<SocketAddr>>,
+    pending_service_tunnels: &HashMap<String, Vec<ServiceAddr>>,
     kad_service_queries: &mut HashMap<kad::QueryId, String>,
 ) {
     for service_name in pending_service_tunnels.keys() {
@@ -802,6 +793,9 @@ fn event_name(event: &Event) -> &'static str {
         Event::ConnectionLost { .. } => "ConnectionLost",
         Event::ServiceProvidersFound { .. } => "ServiceProvidersFound",
         Event::ServiceLookupFailed { .. } => "ServiceLookupFailed",
+        Event::NoBootstrapPeers => "NoBootstrapPeers",
+        Event::ExternalAddrConfirmed { .. } => "ExternalAddrConfirmed",
+        Event::ExternalAddrExpired { .. } => "ExternalAddrExpired",
     }
 }
 

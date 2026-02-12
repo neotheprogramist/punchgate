@@ -5,9 +5,9 @@
 # Topology (single bridge network, mDNS disabled at compile time):
 #
 #   echo (python:3-alpine)         — TCP echo server on 172.28.0.20:7777
-#   bootstrap (punchgate:local)    — public relay node on 172.28.0.10
-#   workhorse (punchgate:local)    — NAT'd peer exposing echo service
-#   client    (punchgate:local)    — tunnels echo through bootstrap → workhorse
+#   bootstrap (punchgate, mDNS disabled) — public relay node on 172.28.0.10
+#   workhorse (punchgate, mDNS disabled) — NAT'd peer exposing echo service
+#   client    (punchgate, mDNS disabled) — tunnels echo through bootstrap → workhorse
 #
 # Flow:
 #   1. Bootstrap starts, logs peer ID
@@ -97,8 +97,8 @@ parse_peer_id() {
 
 # ── Step 1: Build image ───────────────────────────────────────────────────
 
-log "building punchgate:local image (mDNS disabled)..."
-$COMPOSE build --build-arg FEATURES=--no-default-features bootstrap
+log "building punchgate image (mDNS disabled)..."
+$COMPOSE build
 
 # ── Step 2: Start echo + bootstrap ─────────────────────────────────────────
 
@@ -119,7 +119,7 @@ log "bootstrap peer ID = $BOOTSTRAP_ID"
 
 # ── Step 3: Start workhorse ───────────────────────────────────────────────
 
-log "starting workhorse (--nat-status private, --expose echo)..."
+log "starting workhorse (--expose echo)..."
 $COMPOSE up -d --no-recreate workhorse
 
 wait_for_container_log workhorse "listening on /ip4/" "workhorse listening"

@@ -4,7 +4,6 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{
     service::{ExposedService, TunnelByNameSpec},
-    state::NatStatus,
     tunnel::TunnelSpec,
 };
 use libp2p::Multiaddr;
@@ -45,16 +44,6 @@ struct Cli {
     /// Tunnel to a service by name (discovers provider via DHT): service_name@bind_addr
     #[arg(long, env = "PUNCHGATE_TUNNEL_BY_NAME", value_delimiter = ',')]
     tunnel_by_name: Vec<TunnelByNameSpec>,
-
-    /// Override NAT status detection (private or public).
-    /// When set, bypasses AutoNAT wait and immediately enters participation.
-    #[arg(long, env = "PUNCHGATE_NAT_STATUS")]
-    nat_status: Option<NatStatus>,
-
-    /// Declare external address(es) for this node.
-    /// Required for relay servers so clients learn how to reach the relay.
-    #[arg(long, env = "PUNCHGATE_EXTERNAL_ADDRESS", value_delimiter = ',')]
-    external_address: Vec<Multiaddr>,
 }
 
 #[tokio::main]
@@ -74,8 +63,6 @@ async fn main() -> Result<()> {
         exposed: cli.expose,
         tunnel_specs: cli.tunnel,
         tunnel_by_name_specs: cli.tunnel_by_name,
-        nat_status_override: cli.nat_status,
-        external_addrs: cli.external_address,
     })
     .await
 }

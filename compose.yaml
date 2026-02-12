@@ -16,17 +16,21 @@ services:
     command: python3 /echo_server.py --host 0.0.0.0 --port 7777
 
   bootstrap:
-    build: .
-    image: punchgate:local
+    build:
+      context: .
+      args:
+        FEATURES: "--no-default-features"
     networks:
       punchnet:
         ipv4_address: 172.28.0.10
     environment:
       PUNCHGATE_LISTEN: "/ip4/0.0.0.0/tcp/4001"
-      PUNCHGATE_EXTERNAL_ADDRESS: "/ip4/172.28.0.10/tcp/4001"
 
   workhorse:
-    image: punchgate:local
+    build:
+      context: .
+      args:
+        FEATURES: "--no-default-features"
     depends_on:
       - echo
       - bootstrap
@@ -36,11 +40,13 @@ services:
     environment:
       PUNCHGATE_LISTEN: "/ip4/0.0.0.0/tcp/4001"
       PUNCHGATE_BOOTSTRAP: "/ip4/172.28.0.10/tcp/4001/p2p/${BOOTSTRAP_ID}"
-      PUNCHGATE_NAT_STATUS: "private"
       PUNCHGATE_EXPOSE: "echo=172.28.0.20:7777"
 
   client:
-    image: punchgate:local
+    build:
+      context: .
+      args:
+        FEATURES: "--no-default-features"
     depends_on:
       - workhorse
     networks:

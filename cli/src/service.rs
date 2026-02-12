@@ -125,7 +125,7 @@ pub fn parse_expose(spec: &str) -> Result<ExposedService> {
 #[derive(Debug, Clone)]
 pub struct TunnelByNameSpec {
     pub service_name: String,
-    pub bind_addr: SocketAddr,
+    pub bind_addr: ServiceAddr,
 }
 
 #[derive(Debug, Error)]
@@ -135,7 +135,7 @@ pub enum TunnelByNameParseError {
     #[error("service name cannot be empty")]
     EmptyName,
     #[error("invalid bind address: {0}")]
-    InvalidAddr(#[from] std::net::AddrParseError),
+    InvalidAddr(#[from] ServiceAddrParseError),
 }
 
 impl FromStr for TunnelByNameSpec {
@@ -150,7 +150,7 @@ impl FromStr for TunnelByNameSpec {
             return Err(TunnelByNameParseError::EmptyName);
         }
 
-        let bind_addr: SocketAddr = addr_str.parse()?;
+        let bind_addr: ServiceAddr = addr_str.parse()?;
 
         Ok(Self {
             service_name: name.to_string(),
@@ -177,6 +177,8 @@ pub fn service_name_from_key(key: &[u8]) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use proptest::prelude::*;
 
     use super::*;
@@ -309,7 +311,7 @@ mod tests {
             prop_assert!(key_str.ends_with(&name));
         }
 
-        // Roundtrip: TunnelByNameSpec FromStr
+        // Roundtrip: TunnelByNameSpec FromStr with IP address
         #[test]
         fn tunnel_by_name_spec_roundtrip(
             name in arb_service_name(),
@@ -319,7 +321,23 @@ mod tests {
             let parsed: TunnelByNameSpec = spec.parse()
                 .expect("parse generated tunnel-by-name spec");
             prop_assert_eq!(parsed.service_name, name);
-            prop_assert_eq!(parsed.bind_addr, addr);
+            prop_assert_eq!(parsed.bind_addr.host, addr.ip().to_string());
+            prop_assert_eq!(parsed.bind_addr.port, addr.port());
+        }
+
+        // Roundtrip: TunnelByNameSpec FromStr with domain name
+        #[test]
+        fn tunnel_by_name_domain_roundtrip(
+            name in arb_service_name(),
+            host in arb_domain_host(),
+            port in arb_port(),
+        ) {
+            let spec = format!("{name}@{host}:{port}");
+            let parsed: TunnelByNameSpec = spec.parse()
+                .expect("parse generated tunnel-by-name spec with domain");
+            prop_assert_eq!(parsed.service_name, name);
+            prop_assert_eq!(parsed.bind_addr.host, host);
+            prop_assert_eq!(parsed.bind_addr.port, port);
         }
 
         // parse_tunnel_by_name wrapper delegates to FromStr
@@ -332,7 +350,8 @@ mod tests {
             let parsed = parse_tunnel_by_name(&spec)
                 .expect("parse generated tunnel-by-name spec");
             prop_assert_eq!(parsed.service_name, name);
-            prop_assert_eq!(parsed.bind_addr, addr);
+            prop_assert_eq!(parsed.bind_addr.host, addr.ip().to_string());
+            prop_assert_eq!(parsed.bind_addr.port, addr.port());
         }
 
         // Roundtrip: service_name_from_key recovers the name embedded by service_key
