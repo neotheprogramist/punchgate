@@ -7,6 +7,23 @@ use std::{
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use thiserror::Error;
 
+// ─── Address helpers ─────────────────────────────────────────────────────────
+
+fn is_loopback_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => ip.is_loopback(),
+        Protocol::Ip6(ip) => ip.is_loopback(),
+        _ => false,
+    })
+}
+
+fn prefer_non_loopback(addrs: &HashSet<Multiaddr>) -> Option<&Multiaddr> {
+    addrs
+        .iter()
+        .find(|a| !is_loopback_addr(a))
+        .or_else(|| addrs.iter().next())
+}
+
 // ─── Command (output alphabet) ─────────────────────────────────────────────
 
 /// Commands are the output alphabet of the Mealy machine.
@@ -208,12 +225,7 @@ impl PeerState {
         match event {
             Event::ListeningOn { addr } => {
                 commands.push(Command::Log(format!("listening on {addr}")));
-                let is_loopback = addr.iter().any(|p| match p {
-                    Protocol::Ip4(ip) => ip.is_loopback(),
-                    Protocol::Ip6(ip) => ip.is_loopback(),
-                    _ => false,
-                });
-                if !is_loopback {
+                if !is_loopback_addr(&addr) {
                     commands.push(Command::AddExternalAddress(addr));
                 }
             }
@@ -229,12 +241,24 @@ impl PeerState {
                     addr: addr.clone(),
                 });
 
-                if self.phase == Phase::Initializing {
-                    self.phase = Phase::Discovering;
-                    commands.push(Command::KademliaBootstrap);
-                    commands.push(Command::Log(format!(
-                        "bootstrap peer {peer} connected, entering discovery"
-                    )));
+                match self.phase {
+                    Phase::Initializing => {
+                        self.phase = Phase::Discovering;
+                        commands.push(Command::KademliaBootstrap);
+                        commands.push(Command::Log(format!(
+                            "bootstrap peer {peer} connected, entering discovery"
+                        )));
+                    }
+                    Phase::Discovering => {
+                        commands.push(Command::KademliaBootstrap);
+                        commands.push(Command::Log(format!(
+                            "bootstrap peer {peer} reconnected, restarting discovery"
+                        )));
+                        let (s, cmds) = self.maybe_enter_participating();
+                        self = s;
+                        commands.extend(cmds);
+                    }
+                    Phase::Participating | Phase::ShuttingDown => {}
                 }
             }
 
@@ -348,8 +372,19 @@ impl PeerState {
                     self.known_peers.remove(&peer);
                     commands.push(Command::Log(format!("peer {peer} fully disconnected")));
 
-                    // If we've lost all non-bootstrap peers and are
-                    // participating, regress to Discovering
+                    match &self.relay {
+                        RelayState::Requesting { relay_peer }
+                        | RelayState::Reserved { relay_peer }
+                            if *relay_peer == peer =>
+                        {
+                            self.relay = RelayState::Idle;
+                            commands.push(Command::Log(
+                                "relay peer disconnected, resetting relay state".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+
                     if self.phase == Phase::Participating && self.known_peers.is_empty() {
                         self.phase = Phase::Discovering;
                         self.kad_bootstrapped = false;
@@ -413,7 +448,8 @@ impl PeerState {
     /// Unconditionally requests relay reservation from the nearest bootstrap peer.
     fn maybe_enter_participating(mut self) -> (Self, Vec<Command>) {
         let mut commands = Vec::new();
-        if self.phase == Phase::Discovering && self.kad_bootstrapped {
+        if self.phase == Phase::Discovering && self.kad_bootstrapped && !self.known_peers.is_empty()
+        {
             self.phase = Phase::Participating;
             commands.push(Command::PublishServices);
             commands.push(Command::Log(
@@ -425,7 +461,7 @@ impl PeerState {
                     .known_peers
                     .iter()
                     .find(|(p, _)| self.bootstrap_peers.contains(p))
-                && let Some(addr) = addrs.iter().next()
+                && let Some(addr) = prefer_non_loopback(addrs)
             {
                 self.relay = RelayState::Requesting { relay_peer };
                 commands.push(Command::RequestRelayReservation {
@@ -571,9 +607,9 @@ mod tests {
             prop_assert!(new_state.bootstrap_peers.contains(&peer));
         }
 
-        // Second BootstrapConnected doesn't re-issue KademliaBootstrap
+        // Second BootstrapConnected in Discovering re-issues KademliaBootstrap
         #[test]
-        fn second_bootstrap_no_reenter(
+        fn second_bootstrap_reissues_kad_bootstrap(
             peer1 in arb_peer_id(),
             peer2 in arb_peer_id(),
             addr1 in arb_multiaddr(),
@@ -590,8 +626,9 @@ mod tests {
                 peer: peer2,
                 addr: addr2,
             });
+            // Stays Discovering because kad_bootstrapped is still false
             prop_assert_eq!(state.phase, Phase::Discovering);
-            prop_assert!(!commands.contains(&Command::KademliaBootstrap));
+            prop_assert!(commands.contains(&Command::KademliaBootstrap));
         }
 
         // Kad completion alone triggers Participating (NAT is orthogonal)
@@ -1016,6 +1053,95 @@ mod tests {
             prop_assume!(s != "private" && s != "public");
             let result: Result<NatStatus, _> = s.parse();
             prop_assert!(result.is_err());
+        }
+
+        // KademliaBootstrapOk with empty known_peers stays in Discovering
+        #[test]
+        fn kad_ok_with_empty_peers_stays_discovering(
+            nat_status in arb_nat_status(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = Phase::Discovering;
+            state.nat_status = nat_status;
+
+            let (state, commands) = state.transition(Event::KademliaBootstrapOk);
+            prop_assert_eq!(state.phase, Phase::Discovering);
+            prop_assert!(state.kad_bootstrapped);
+            prop_assert!(!commands.contains(&Command::PublishServices));
+        }
+
+        // Bootstrap reconnection in Discovering with prior kad success enters Participating
+        #[test]
+        fn bootstrap_reconnect_in_discovering_enters_participating(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = Phase::Discovering;
+            state.kad_bootstrapped = true;
+            state.bootstrap_peers.insert(peer);
+
+            let (state, commands) = state.transition(Event::BootstrapConnected {
+                peer, addr,
+            });
+            prop_assert_eq!(state.phase, Phase::Participating);
+            prop_assert!(commands.contains(&Command::PublishServices));
+            prop_assert!(commands.contains(&Command::KademliaBootstrap));
+        }
+
+        // Relay address selection prefers non-loopback over loopback
+        #[test]
+        fn relay_addr_prefers_non_loopback(
+            peer in arb_peer_id(),
+            external_addr in arb_nonloopback_multiaddr(),
+            port in 1024u16..65535u16,
+        ) {
+            let loopback_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}")
+                .parse()
+                .expect("loopback multiaddr is always valid");
+
+            let mut state = PeerState::new();
+            state.phase = Phase::Discovering;
+            state.bootstrap_peers.insert(peer);
+            let addrs = state.known_peers.entry(peer).or_default();
+            addrs.insert(loopback_addr);
+            addrs.insert(external_addr.clone());
+
+            let (_, commands) = state.transition(Event::KademliaBootstrapOk);
+
+            let relay_addr = commands.iter().find_map(|c| match c {
+                Command::RequestRelayReservation { relay_addr, .. } => Some(relay_addr),
+                _ => None,
+            });
+            if let Some(addr) = relay_addr {
+                prop_assert!(!is_loopback_addr(addr));
+            }
+        }
+
+        // ConnectionLost resets relay state when relay peer disconnects
+        #[test]
+        fn connection_lost_resets_relay_for_relay_peer(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+            other_peer in arb_peer_id(),
+            other_addr in arb_multiaddr(),
+        ) {
+            prop_assume!(peer != other_peer);
+
+            let mut state = PeerState::new();
+            state.phase = Phase::Participating;
+            state.relay = RelayState::Reserved { relay_peer: peer };
+            state.known_peers.entry(peer).or_default().insert(addr);
+            state.known_peers.entry(other_peer).or_default().insert(other_addr);
+
+            let (state, _) = state.transition(Event::ConnectionLost {
+                peer,
+                remaining_connections: 0,
+            });
+
+            prop_assert_eq!(state.relay, RelayState::Idle);
+            // Does not regress to Discovering since other_peer remains
+            prop_assert_eq!(state.phase, Phase::Participating);
         }
     }
 }

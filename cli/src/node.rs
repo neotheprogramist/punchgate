@@ -151,6 +151,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     for peer_id in &bootstrap_peer_ids {
         peer_state.bootstrap_peers.insert(*peer_id);
     }
+    let mut active_bootstrap_query: Option<kad::QueryId> = None;
 
     if config.bootstrap_addrs.is_empty() {
         let old_phase = peer_state.phase;
@@ -163,7 +164,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             );
         }
         peer_state = new_state;
-        execute_commands(&mut swarm, &commands, &config.exposed);
+        execute_commands(
+            &mut swarm,
+            &commands,
+            &config.exposed,
+            &mut active_bootstrap_query,
+        );
     }
 
     let discovery_deadline = tokio::time::sleep(DISCOVERY_TIMEOUT);
@@ -320,6 +326,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 if let Some(state_event) = translate_swarm_event(
                     &event,
                     &bootstrap_peer_ids,
+                    active_bootstrap_query,
                 ) {
                     if let Event::HolePunchSucceeded { remote_peer } = &state_event {
                         if let Some(specs) = pending_tunnels.remove(remote_peer) {
@@ -350,6 +357,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         &mut swarm,
                         &commands,
                         &config.exposed,
+                        &mut active_bootstrap_query,
                     );
 
                     // Initiate DHT lookups when transitioning to Participating
@@ -379,7 +387,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                 }
                 peer_state = new_state;
-                execute_commands(&mut swarm, &commands, &config.exposed);
+                execute_commands(&mut swarm, &commands, &config.exposed, &mut active_bootstrap_query);
 
                 if old_phase != Phase::Participating && peer_state.phase == Phase::Participating {
                     initiate_tunnel_lookups(&mut swarm, &pending_tunnels, &mut kad_tunnel_queries);
@@ -436,7 +444,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                 }
                 peer_state = new_state;
-                execute_commands(&mut swarm, &commands, &config.exposed);
+                execute_commands(&mut swarm, &commands, &config.exposed, &mut active_bootstrap_query);
                 if peer_state.phase == Phase::ShuttingDown {
                     tracing::info!("shutting down");
                     break;
@@ -455,6 +463,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 fn translate_swarm_event(
     event: &SwarmEvent<BehaviourEvent>,
     bootstrap_peers: &HashSet<PeerId>,
+    active_bootstrap_query: Option<kad::QueryId>,
 ) -> Option<Event> {
     match event {
         SwarmEvent::NewListenAddr { address, .. } => Some(Event::ListeningOn {
@@ -483,7 +492,9 @@ fn translate_swarm_event(
             remaining_connections: *num_established,
         }),
 
-        SwarmEvent::Behaviour(behaviour_event) => translate_behaviour_event(behaviour_event),
+        SwarmEvent::Behaviour(behaviour_event) => {
+            translate_behaviour_event(behaviour_event, active_bootstrap_query)
+        }
 
         SwarmEvent::ListenerError { error, .. } => {
             tracing::warn!(error = %error, "listener error");
@@ -518,17 +529,26 @@ fn translate_swarm_event(
     }
 }
 
-fn translate_behaviour_event(event: &BehaviourEvent) -> Option<Event> {
+fn translate_behaviour_event(
+    event: &BehaviourEvent,
+    active_bootstrap_query: Option<kad::QueryId>,
+) -> Option<Event> {
     match event {
         BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+            id,
             result: kad::QueryResult::Bootstrap(result),
             ..
-        }) => match result {
-            Ok(_) => Some(Event::KademliaBootstrapOk),
-            Err(e) => Some(Event::KademliaBootstrapFailed {
-                reason: e.to_string(),
-            }),
-        },
+        }) => {
+            if active_bootstrap_query != Some(*id) {
+                return None;
+            }
+            match result {
+                Ok(_) => Some(Event::KademliaBootstrapOk),
+                Err(e) => Some(Event::KademliaBootstrapFailed {
+                    reason: e.to_string(),
+                }),
+            }
+        }
         // kad::Event is #[non_exhaustive] — wildcard covers other query types
         BehaviourEvent::Kademlia(_) => None,
 
@@ -600,6 +620,7 @@ fn execute_commands(
     swarm: &mut libp2p::Swarm<Behaviour>,
     commands: &[Command],
     exposed: &[ExposedService],
+    active_bootstrap_query: &mut Option<kad::QueryId>,
 ) {
     for cmd in commands {
         match cmd {
@@ -613,11 +634,13 @@ fn execute_commands(
                     tracing::warn!(%addr, error = %e, "listen failed");
                 }
             }
-            Command::KademliaBootstrap => {
-                if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+            Command::KademliaBootstrap => match swarm.behaviour_mut().kademlia.bootstrap() {
+                Ok(query_id) => *active_bootstrap_query = Some(query_id),
+                Err(e) => {
+                    *active_bootstrap_query = None;
                     tracing::warn!(error = %e, "kademlia bootstrap failed");
                 }
-            }
+            },
             Command::KademliaAddAddress { peer, addr } => {
                 swarm
                     .behaviour_mut()
