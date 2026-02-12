@@ -259,7 +259,29 @@ impl PeerState {
                         self = s;
                         commands.extend(cmds);
                     }
-                    Phase::Participating | Phase::ShuttingDown => {}
+                    Phase::Participating => {
+                        commands.push(Command::KademliaBootstrap);
+                        commands.push(Command::Log(format!(
+                            "bootstrap peer {peer} reconnected during participation, refreshing"
+                        )));
+                        match &self.relay {
+                            RelayState::Idle => {
+                                if let Some(relay_addr) = self
+                                    .known_peers
+                                    .get(&peer)
+                                    .and_then(|addrs| prefer_non_loopback(addrs))
+                                {
+                                    self.relay = RelayState::Requesting { relay_peer: peer };
+                                    commands.push(Command::RequestRelayReservation {
+                                        relay_peer: peer,
+                                        relay_addr: relay_addr.clone(),
+                                    });
+                                }
+                            }
+                            RelayState::Requesting { .. } | RelayState::Reserved { .. } => {}
+                        }
+                    }
+                    Phase::ShuttingDown => {}
                 }
             }
 
@@ -295,15 +317,20 @@ impl PeerState {
                 }
             }
 
-            Event::DiscoveryTimeout => match self.phase {
-                Phase::Discovering => {
+            Event::DiscoveryTimeout => match (self.phase, self.known_peers.is_empty()) {
+                (Phase::Discovering, false) => {
                     self.phase = Phase::Participating;
                     commands.push(Command::PublishServices);
                     commands.push(Command::Log(
                         "discovery timeout, entering participation".into(),
                     ));
                 }
-                Phase::Initializing | Phase::Participating | Phase::ShuttingDown => {}
+                (Phase::Discovering, true) => {
+                    commands.push(Command::Log(
+                        "discovery timeout with no known peers, staying in discovery".into(),
+                    ));
+                }
+                (Phase::Initializing | Phase::Participating | Phase::ShuttingDown, _) => {}
             },
 
             Event::MdnsDiscovered { peers } => {
@@ -684,9 +711,9 @@ mod tests {
             prop_assert!(commands.contains(&Command::PublishServices));
         }
 
-        // DiscoveryTimeout from Discovering forces Participating
+        // DiscoveryTimeout from Discovering enters Participating only with known peers
         #[test]
-        fn discovery_timeout_forces_participating(
+        fn discovery_timeout_enters_participating_with_peers(
             peer in arb_peer_id(),
             addr in arb_multiaddr(),
         ) {
@@ -697,6 +724,70 @@ mod tests {
             let (state, commands) = state.transition(Event::DiscoveryTimeout);
             prop_assert_eq!(state.phase, Phase::Participating);
             prop_assert!(commands.contains(&Command::PublishServices));
+        }
+
+        // DiscoveryTimeout with zero known peers stays in Discovering
+        #[test]
+        fn discovery_timeout_with_no_peers_stays_discovering(
+            nat_status in arb_nat_status(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = Phase::Discovering;
+            state.nat_status = nat_status;
+
+            let (state, commands) = state.transition(Event::DiscoveryTimeout);
+            prop_assert_eq!(state.phase, Phase::Discovering);
+            prop_assert!(!commands.contains(&Command::PublishServices));
+        }
+
+        // BootstrapConnected in Participating re-bootstraps Kademlia and requests relay
+        #[test]
+        fn bootstrap_reconnect_in_participating_refreshes(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = Phase::Participating;
+            state.relay = RelayState::Idle;
+            state.bootstrap_peers.insert(peer);
+
+            let (state, commands) = state.transition(Event::BootstrapConnected {
+                peer, addr,
+            });
+            prop_assert_eq!(state.phase, Phase::Participating);
+            prop_assert!(commands.contains(&Command::KademliaBootstrap));
+            let has_relay_cmd = commands.iter().any(|c| matches!(
+                c,
+                Command::RequestRelayReservation { relay_peer, .. }
+                if *relay_peer == peer
+            ));
+            prop_assert!(has_relay_cmd);
+            prop_assert_eq!(state.relay, RelayState::Requesting { relay_peer: peer });
+        }
+
+        // BootstrapConnected in Participating skips relay if already reserved
+        #[test]
+        fn bootstrap_reconnect_in_participating_skips_relay_if_reserved(
+            peer in arb_peer_id(),
+            other_peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            prop_assume!(peer != other_peer);
+            let mut state = PeerState::new();
+            state.phase = Phase::Participating;
+            state.relay = RelayState::Reserved { relay_peer: other_peer };
+            state.bootstrap_peers.insert(peer);
+
+            let (state, commands) = state.transition(Event::BootstrapConnected {
+                peer, addr,
+            });
+            prop_assert!(commands.contains(&Command::KademliaBootstrap));
+            prop_assert_eq!(state.relay, RelayState::Reserved { relay_peer: other_peer });
+            let has_relay_cmd = commands.iter().any(|c| matches!(
+                c,
+                Command::RequestRelayReservation { .. }
+            ));
+            prop_assert!(!has_relay_cmd);
         }
 
         // NatStatusChanged always updates the nat_status field
