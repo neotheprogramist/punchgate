@@ -426,18 +426,27 @@ impl PeerState {
                         | RelayState::Idle => {}
                     }
 
-                    match (self.phase, self.known_peers.is_empty()) {
-                        (Phase::Participating, true) => {
+                    match (
+                        self.phase,
+                        self.known_peers.is_empty(),
+                        self.bootstrap_peers.is_empty(),
+                    ) {
+                        (Phase::Participating, true, false) => {
                             self.phase = Phase::Discovering;
                             self.kad_bootstrapped = false;
                             commands.push(Command::KademliaBootstrap);
                             commands
                                 .push(Command::Log("all peers lost, re-entering discovery".into()));
                         }
-                        (Phase::Participating, false)
-                        | (Phase::Initializing, _)
-                        | (Phase::Discovering, _)
-                        | (Phase::ShuttingDown, _) => {}
+                        (Phase::Participating, true, true) => {
+                            commands.push(Command::Log(
+                                "all peers lost but no bootstrap peers configured, staying in participation".into(),
+                            ));
+                        }
+                        (Phase::Participating, false, _)
+                        | (Phase::Initializing, ..)
+                        | (Phase::Discovering, ..)
+                        | (Phase::ShuttingDown, ..) => {}
                     }
                 }
             }
@@ -1021,7 +1030,7 @@ mod tests {
             prop_assert_eq!(kad_add_count, addrs.len());
         }
 
-        // ConnectionLost with 0 remaining removes peer and regresses when empty
+        // ConnectionLost with 0 remaining removes peer and regresses when empty (with bootstrap peers)
         #[test]
         fn connection_lost_removes_peer_and_regresses(
             peer in arb_peer_id(),
@@ -1030,6 +1039,7 @@ mod tests {
             let mut state = PeerState::new();
             state.phase = Phase::Participating;
             state.kad_bootstrapped = true;
+            state.bootstrap_peers.insert(peer);
             state.known_peers.entry(peer).or_default().insert(addr);
 
             let (new_state, commands) = state.transition(Event::ConnectionLost {
@@ -1041,6 +1051,29 @@ mod tests {
             prop_assert_eq!(new_state.phase, Phase::Discovering);
             prop_assert!(!new_state.kad_bootstrapped);
             prop_assert!(commands.contains(&Command::KademliaBootstrap));
+        }
+
+        // Standalone node (no bootstrap peers) stays in Participating when losing all peers
+        #[test]
+        fn connection_lost_standalone_stays_participating(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = Phase::Participating;
+            state.kad_bootstrapped = true;
+            state.known_peers.entry(peer).or_default().insert(addr);
+            // No bootstrap_peers — standalone mode
+
+            let (new_state, commands) = state.transition(Event::ConnectionLost {
+                peer,
+                remaining_connections: 0,
+            });
+
+            prop_assert!(!new_state.known_peers.contains_key(&peer));
+            prop_assert_eq!(new_state.phase, Phase::Participating);
+            prop_assert!(new_state.kad_bootstrapped);
+            prop_assert!(!commands.contains(&Command::KademliaBootstrap));
         }
 
         // ConnectionLost with remaining > 0 preserves the peer

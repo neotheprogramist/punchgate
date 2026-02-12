@@ -180,6 +180,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
+    let shutdown_signal = shutdown::shutdown_signal();
+    tokio::pin!(shutdown_signal);
+
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
 
@@ -362,7 +365,24 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 tracing::error!(%remote_peer, %reason, "hole punch failed — tunnel cannot be established (direct connection required)");
                             }
                         }
-                        _ => {}
+                        Event::ListeningOn { .. }
+                        | Event::BootstrapConnected { .. }
+                        | Event::ShutdownRequested
+                        | Event::KademliaBootstrapOk
+                        | Event::KademliaBootstrapFailed { .. }
+                        | Event::MdnsDiscovered { .. }
+                        | Event::MdnsExpired { .. }
+                        | Event::PeerIdentified { .. }
+                        | Event::NatStatusChanged(_)
+                        | Event::DiscoveryTimeout
+                        | Event::RelayReservationAccepted { .. }
+                        | Event::RelayReservationFailed { .. }
+                        | Event::ConnectionLost { .. }
+                        | Event::ServiceProvidersFound { .. }
+                        | Event::ServiceLookupFailed { .. }
+                        | Event::NoBootstrapPeers
+                        | Event::ExternalAddrConfirmed { .. }
+                        | Event::ExternalAddrExpired { .. } => {}
                     }
 
                     let old_phase = peer_state.phase;
@@ -444,7 +464,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     }
                 }
             }
-            _ = shutdown::shutdown_signal() => {
+            _ = &mut shutdown_signal => {
                 let old_phase = peer_state.phase;
                 let (new_state, commands) = peer_state.transition(Event::ShutdownRequested);
                 tracing::debug!(event = "ShutdownRequested", commands = commands.len(), "event processed");
@@ -842,16 +862,19 @@ fn phase_name(phase: Phase) -> &'static str {
 
 fn log_phase_transition(event: &str, old: Phase, new: Phase, commands: usize) {
     match (old, new) {
-        (o, n) if o != n => {
+        (Phase::Initializing, Phase::Initializing)
+        | (Phase::Discovering, Phase::Discovering)
+        | (Phase::Participating, Phase::Participating)
+        | (Phase::ShuttingDown, Phase::ShuttingDown) => {}
+        (old, new) => {
             tracing::info!(
                 event,
-                from = phase_name(o),
-                to = phase_name(n),
+                from = phase_name(old),
+                to = phase_name(new),
                 commands,
                 "phase transition"
             );
         }
-        _ => {}
     }
 }
 
