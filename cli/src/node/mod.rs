@@ -149,6 +149,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
         tokio::select! {
             event = swarm.select_next_some() => {
+                if let SwarmEvent::NewListenAddr { address, .. } = &event {
+                    tracing::info!("listening on {address}");
+                }
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
                 }
@@ -205,6 +208,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 );
 
                 for state_event in events {
+                    if let Event::RelayReservationAccepted { relay_peer } = &state_event {
+                        tracing::info!(%relay_peer, "relay reservation accepted");
+                    }
                     let old_phase = app_state.phase();
                     let event_label = state_event.to_string();
                     let (new_state, commands) = app_state.transition(state_event);

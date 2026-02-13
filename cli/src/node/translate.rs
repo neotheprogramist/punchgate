@@ -204,7 +204,7 @@ fn translate_behaviour_event(
         BehaviourEvent::RelayServer(_) => vec![],
         BehaviourEvent::Ping(ping::Event { peer, result, .. }) => {
             match result {
-                Ok(rtt) => tracing::info!(%peer, rtt = ?rtt, "ping"),
+                Ok(rtt) => tracing::debug!(%peer, rtt = ?rtt, "ping"),
                 Err(e) => tracing::warn!(%peer, error = %e, "ping failed"),
             }
             vec![]
@@ -278,6 +278,7 @@ pub fn is_active_bootstrap_result(
 #[cfg(test)]
 mod tests {
     use libp2p::{Multiaddr, PeerId, kad};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -288,11 +289,11 @@ mod tests {
         let store = kad::store::MemoryStore::new(local_peer);
         let mut kademlia = kad::Behaviour::with_config(local_peer, store, kad_config);
 
-        let fake_peer = PeerId::random();
+        // Infallible: static multiaddr literal is always valid
         let fake_addr: Multiaddr = "/ip4/1.2.3.4/tcp/5678"
             .parse()
             .expect("static multiaddr is always valid");
-        kademlia.add_address(&fake_peer, fake_addr);
+        kademlia.add_address(&PeerId::random(), fake_addr);
 
         let qid1 = kademlia
             .bootstrap()
@@ -301,33 +302,22 @@ mod tests {
         (qid1, qid2)
     }
 
-    #[test]
-    fn matching_id_last_step_accepted() {
-        let (qid, _) = make_query_ids();
-        assert!(is_active_bootstrap_result(qid, Some(qid), true));
-    }
+    proptest! {
+        #[test]
+        fn active_bootstrap_accepts_only_matching_last_step(step_last in any::<bool>()) {
+            let (qid, other) = make_query_ids();
 
-    #[test]
-    fn non_matching_id_rejected() {
-        let (qid, other) = make_query_ids();
-        assert!(!is_active_bootstrap_result(other, Some(qid), true));
-    }
+            // Only matching ID on last step is accepted
+            prop_assert_eq!(
+                is_active_bootstrap_result(qid, Some(qid), step_last),
+                step_last,
+            );
 
-    #[test]
-    fn intermediate_step_rejected() {
-        let (qid, _) = make_query_ids();
-        assert!(!is_active_bootstrap_result(qid, Some(qid), false));
-    }
+            // Non-matching ID always rejected
+            prop_assert!(!is_active_bootstrap_result(other, Some(qid), step_last));
 
-    #[test]
-    fn no_active_query_rejected() {
-        let (qid, _) = make_query_ids();
-        assert!(!is_active_bootstrap_result(qid, None, true));
-    }
-
-    #[test]
-    fn both_none_and_not_last_rejected() {
-        let (qid, _) = make_query_ids();
-        assert!(!is_active_bootstrap_result(qid, None, false));
+            // No active query always rejected
+            prop_assert!(!is_active_bootstrap_result(qid, None, step_last));
+        }
     }
 }

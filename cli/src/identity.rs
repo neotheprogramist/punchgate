@@ -34,31 +34,22 @@ pub fn load_or_generate(path: &Path) -> Result<Keypair> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
-    #[test]
-    fn roundtrip_identity() {
-        let dir = tempfile::tempdir().expect("create temp directory");
-        let path = dir.path().join("identity.key");
+    proptest! {
+        #[test]
+        fn roundtrip_identity(suffix in "[a-z]{1,10}") {
+            let dir = tempfile::tempdir().expect("create temp directory");
+            let path = dir.path().join(format!("{suffix}/identity.key"));
 
-        let kp1 = load_or_generate(&path).expect("generate identity keypair");
-        let kp2 = load_or_generate(&path).expect("reload identity keypair");
+            let kp1 = load_or_generate(&path).expect("generate identity keypair");
+            prop_assert!(path.exists());
+            prop_assert_eq!(kp1.key_type(), libp2p::identity::KeyType::Ed25519);
 
-        assert_eq!(
-            kp1.public().to_peer_id(),
-            kp2.public().to_peer_id(),
-            "reloaded identity must match"
-        );
-    }
-
-    #[test]
-    fn generates_fresh_if_missing() {
-        let dir = tempfile::tempdir().expect("create temp directory");
-        let path = dir.path().join("subdir/identity.key");
-
-        assert!(!path.exists());
-        let kp = load_or_generate(&path).expect("generate identity in subdir");
-        assert!(path.exists());
-        assert_eq!(kp.key_type(), libp2p::identity::KeyType::Ed25519);
+            let kp2 = load_or_generate(&path).expect("reload identity keypair");
+            prop_assert_eq!(kp1.public().to_peer_id(), kp2.public().to_peer_id());
+        }
     }
 }

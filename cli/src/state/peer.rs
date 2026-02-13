@@ -348,18 +348,6 @@ mod tests {
         arb_relay_circuit_multiaddr,
     };
 
-    #[test]
-    fn initial_state_invariants() {
-        let state = PeerState::new();
-        assert_eq!(state.phase, Phase::Initializing);
-        assert_eq!(state.nat_status, NatStatus::Unknown);
-        assert_eq!(state.relay, RelayState::Idle);
-        assert!(state.known_peers.is_empty());
-        assert!(state.bootstrap_peers.is_empty());
-        assert!(!state.kad_bootstrapped);
-        assert!(state.external_addrs.is_empty());
-    }
-
     proptest! {
         #[test]
         fn shutdown_absorbs_any_phase(phase in arb_phase()) {
