@@ -178,5 +178,25 @@ else
     fail "tunnel echo mismatch"
 fi
 
-log "data path: nc → :$TUNNEL_PORT → client (--tunnel-by-name) → bootstrap relay → workhorse → echo → back"
+# ── Step 7: Verify hole punch status ─────────────────────────────────────
+
+HP_SUCCESS=$($COMPOSE logs client workhorse 2>&1 | grep -c "hole punch succeeded" || true)
+HP_FAILURE=$($COMPOSE logs client workhorse 2>&1 | grep -c "hole punch failed" || true)
+
+if [[ "$HP_SUCCESS" -gt 0 ]]; then
+    pass "DCUtR hole punch succeeded ($HP_SUCCESS event(s))"
+elif [[ "$HP_FAILURE" -gt 0 ]]; then
+    warn "DCUtR hole punch failed ($HP_FAILURE event(s)) — tunnel used relay or direct fallback"
+    warn "── client log (last 30 lines) ──"
+    $COMPOSE logs --tail 30 client 2>&1 || true
+    warn "── workhorse log (last 30 lines) ──"
+    $COMPOSE logs --tail 30 workhorse 2>&1 || true
+    fail "hole punch failed — on a flat bridge network this is unexpected"
+else
+    # On a single bridge network, Kademlia DHT walking connects peers directly
+    # before the relay path is used, so DCUtR never fires. This is correct
+    # behavior — DCUtR is only needed when the initial connection is relayed.
+    warn "no DCUtR events — peers connected directly (expected on flat bridge network)"
+fi
+
 log "done."

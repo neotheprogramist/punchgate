@@ -208,8 +208,17 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 );
 
                 for state_event in events {
-                    if let Event::RelayReservationAccepted { relay_peer } = &state_event {
-                        tracing::info!(%relay_peer, "relay reservation accepted");
+                    match &state_event {
+                        Event::RelayReservationAccepted { relay_peer } => {
+                            tracing::info!(%relay_peer, "relay reservation accepted");
+                        }
+                        Event::HolePunchSucceeded { remote_peer } => {
+                            tracing::info!(peer = %remote_peer, "hole punch succeeded");
+                        }
+                        Event::HolePunchFailed { remote_peer, reason } => {
+                            tracing::warn!(peer = %remote_peer, %reason, "hole punch failed");
+                        }
+                        _ => {}
                     }
                     let old_phase = app_state.phase();
                     let event_label = state_event.to_string();
