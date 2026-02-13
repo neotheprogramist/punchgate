@@ -1,4 +1,5 @@
 pub mod behaviour;
+pub mod external_addr;
 pub mod identity;
 pub mod node;
 pub mod protocol;

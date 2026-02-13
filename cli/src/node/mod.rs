@@ -20,6 +20,7 @@ use self::{
 };
 use crate::{
     behaviour::Behaviour,
+    external_addr,
     protocol::{self, DISCOVERY_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
     shutdown,
     specs::{ExposedService, ServiceAddr, TunnelByNameSpec, TunnelSpec},
@@ -80,6 +81,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         )?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
+
+    tracing::info!("discovering external IP address...");
+    let external_ip = external_addr::discover_external_ip().await.ok_or_else(|| {
+        anyhow::anyhow!("failed to discover external IP address — all services unreachable")
+    })?;
 
     let mut stream_control = swarm.behaviour().stream.new_control();
     let incoming = stream_control
@@ -151,6 +157,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             event = swarm.select_next_some() => {
                 if let SwarmEvent::NewListenAddr { address, .. } = &event {
                     tracing::info!("listening on {address}");
+                    if let Some(ext_addr) = external_addr::make_external_addr(address, external_ip) {
+                        tracing::info!(%ext_addr, "registering external address");
+                        swarm.add_external_address(ext_addr);
+                    }
                 }
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
