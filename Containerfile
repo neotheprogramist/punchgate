@@ -1,7 +1,7 @@
 ARG APP_NAME=cli
 ARG FEATURES=
 
-FROM rust:1.92.0-alpine3.21 AS base
+FROM rust:1.93.1-alpine3.21 AS base
 RUN apk add --no-cache build-base libressl-dev cmake
 RUN cargo install cargo-chef sccache --locked
 ENV RUSTC_WRAPPER=sccache \
