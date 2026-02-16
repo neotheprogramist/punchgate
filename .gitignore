@@ -1,6 +1,9 @@
 # Claude Code
 .claude/
 
+# Identity
+identity.key
+
 # Environment variables
 .env
 
