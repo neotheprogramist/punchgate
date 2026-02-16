@@ -4,7 +4,6 @@ mod translate;
 
 use std::{
     collections::{HashMap, HashSet},
-    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -40,7 +39,6 @@ pub struct NodeConfig {
     pub exposed: Vec<ExposedService>,
     pub tunnel_specs: Vec<TunnelSpec>,
     pub tunnel_by_name_specs: Vec<TunnelByNameSpec>,
-    pub external_address: Option<IpAddr>,
 }
 
 pub async fn run(config: NodeConfig) -> Result<()> {
@@ -78,19 +76,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         )?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
-
-    let external_ip = match config.external_address {
-        Some(ip) => {
-            tracing::info!(%ip, "using provided external IP address");
-            ip
-        }
-        None => {
-            tracing::info!("discovering external IP address...");
-            external_addr::discover_external_ip().await.ok_or_else(|| {
-                anyhow::anyhow!("failed to discover external IP address — all services unreachable")
-            })?
-        }
-    };
 
     let mut stream_control = swarm.behaviour().stream.new_control();
     let incoming = stream_control
@@ -162,10 +147,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
             event = swarm.select_next_some() => {
                 if let SwarmEvent::NewListenAddr { address, .. } = &event {
                     tracing::info!("listening on {address}");
-                    if let Some(ext_addr) = external_addr::make_external_addr(address, external_ip) {
-                        tracing::info!(%ext_addr, "registering external address for DHT");
-                        swarm.add_external_address(ext_addr);
-                    }
                 }
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
@@ -228,6 +209,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 );
 
                 for state_event in events {
+                    // Bootstrap server: confirm observed addresses from Identify
+                    // (first node has nobody to AutoNAT it)
+                    if bootstrap_peer_ids.is_empty()
+                        && let Event::PeerIdentified { observed_addr, .. } = &state_event
+                    {
+                        swarm.add_external_address(observed_addr.clone());
+                    }
+
                     match &state_event {
                         Event::RelayReservationAccepted { relay_peer } => {
                             tracing::info!(%relay_peer, "relay reservation accepted");
@@ -254,13 +243,13 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             tracing::info!("shutting down");
                             break;
                         }
-                        Phase::Initializing | Phase::Discovering | Phase::Participating => {}
+                        Phase::Joining | Phase::Ready => {}
                     }
                 }
 
                 match app_state.phase() {
                     Phase::ShuttingDown => break,
-                    Phase::Initializing | Phase::Discovering | Phase::Participating => {}
+                    Phase::Joining | Phase::Ready => {}
                 }
             }
             _ = &mut discovery_deadline, if !discovery_timeout_fired => {
@@ -272,7 +261,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 app_state = new_state;
                 execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
             }
-            _ = republish_interval.tick(), if app_state.phase() == Phase::Participating => {
+            _ = republish_interval.tick(), if app_state.phase() == Phase::Ready => {
                 publish_services(&mut swarm, &config.exposed);
             }
             _ = async {
@@ -319,7 +308,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         tracing::info!("shutting down");
                         break;
                     }
-                    Phase::Initializing | Phase::Discovering | Phase::Participating => {}
+                    Phase::Joining | Phase::Ready => {}
                 }
             }
         }

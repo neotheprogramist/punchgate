@@ -1,53 +1,6 @@
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
+use std::net::Ipv4Addr;
 
 use libp2p::{Multiaddr, multiaddr::Protocol};
-
-const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-
-const DISCOVERY_URLS: &[&str] = &[
-    "https://ifconfig.me",
-    "https://api.ipify.org",
-    "https://icanhazip.com",
-];
-
-pub async fn discover_external_ip() -> Option<IpAddr> {
-    let client = reqwest::Client::builder()
-        .timeout(DISCOVERY_TIMEOUT)
-        .build()
-        .ok()?;
-
-    for url in DISCOVERY_URLS {
-        match client
-            .get(*url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            Ok(resp) => match resp.text().await {
-                Ok(body) => match body.trim().parse::<IpAddr>() {
-                    Ok(ip) => {
-                        tracing::info!(%ip, service = %url, "discovered external IP");
-                        return Some(ip);
-                    }
-                    Err(e) => {
-                        tracing::debug!(service = %url, body = %body.trim(), error = %e, "failed to parse IP");
-                    }
-                },
-                Err(e) => {
-                    tracing::debug!(service = %url, error = %e, "failed to read response body");
-                }
-            },
-            Err(e) => {
-                tracing::debug!(service = %url, error = %e, "external IP discovery request failed");
-            }
-        }
-    }
-    tracing::warn!("could not discover external IP from any service");
-    None
-}
 
 fn needs_external_rewrite(ip: Ipv4Addr) -> bool {
     ip.is_unspecified() || ip.is_private() || ip.is_loopback()
@@ -69,32 +22,9 @@ pub fn is_valid_external_candidate(addr: &Multiaddr) -> bool {
     !is_circuit_addr(addr) && has_public_ip(addr)
 }
 
-pub fn make_external_addr(listen_addr: &Multiaddr, external_ip: IpAddr) -> Option<Multiaddr> {
-    if is_circuit_addr(listen_addr) {
-        return None;
-    }
-
-    let mut rewritten = false;
-    let new_addr = listen_addr
-        .iter()
-        .map(|proto| match proto {
-            Protocol::Ip4(ip) if needs_external_rewrite(ip) => {
-                rewritten = true;
-                match external_ip {
-                    IpAddr::V4(v4) => Protocol::Ip4(v4),
-                    IpAddr::V6(v6) => Protocol::Ip6(v6),
-                }
-            }
-            other => other,
-        })
-        .collect::<Multiaddr>();
-
-    rewritten.then_some(new_addr)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     use libp2p::Multiaddr;
     use proptest::prelude::*;
@@ -125,66 +55,6 @@ mod tests {
 
     proptest! {
         #[test]
-        fn rewrites_private_ip_in_tcp_addr(
-            private_ip in arb_private_ipv4(),
-            external_ip in arb_external_ipv4(),
-            port in arb_port(),
-        ) {
-            let listen: Multiaddr = format!("/ip4/{private_ip}/tcp/{port}")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            let result = make_external_addr(&listen, IpAddr::V4(external_ip));
-            let expected: Multiaddr = format!("/ip4/{external_ip}/tcp/{port}")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            prop_assert_eq!(result, Some(expected));
-        }
-
-        #[test]
-        fn rewrites_unspecified_ip_in_tcp_addr(
-            external_ip in arb_external_ipv4(),
-            port in arb_port(),
-        ) {
-            let listen: Multiaddr = format!("/ip4/0.0.0.0/tcp/{port}")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            let result = make_external_addr(&listen, IpAddr::V4(external_ip));
-            let expected: Multiaddr = format!("/ip4/{external_ip}/tcp/{port}")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            prop_assert_eq!(result, Some(expected));
-        }
-
-        #[test]
-        fn rewrites_private_ip_in_quic_addr(
-            private_ip in arb_private_ipv4(),
-            external_ip in arb_external_ipv4(),
-            port in arb_port(),
-        ) {
-            let listen: Multiaddr = format!("/ip4/{private_ip}/udp/{port}/quic-v1")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            let result = make_external_addr(&listen, IpAddr::V4(external_ip));
-            let expected: Multiaddr = format!("/ip4/{external_ip}/udp/{port}/quic-v1")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            prop_assert_eq!(result, Some(expected));
-        }
-
-        #[test]
-        fn skips_already_public_ip(
-            external_ip in arb_external_ipv4(),
-            listen_ip in arb_external_ipv4(),
-            port in arb_port(),
-        ) {
-            let listen: Multiaddr = format!("/ip4/{listen_ip}/tcp/{port}")
-                .parse()
-                .expect("static format produces valid multiaddr");
-            let result = make_external_addr(&listen, IpAddr::V4(external_ip));
-            prop_assert_eq!(result, None);
-        }
-
-        #[test]
         fn needs_rewrite_for_all_private_ranges(ip in arb_private_ipv4()) {
             prop_assert!(needs_external_rewrite(ip));
         }
@@ -192,19 +62,6 @@ mod tests {
         #[test]
         fn no_rewrite_for_public_ips(ip in arb_external_ipv4()) {
             prop_assert!(!needs_external_rewrite(ip));
-        }
-
-        #[test]
-        fn skips_relay_circuit_addr(
-            relay_ip in arb_private_ipv4(),
-            external_ip in arb_external_ipv4(),
-            port in arb_port(),
-        ) {
-            let circuit: Multiaddr = format!(
-                "/ip4/{relay_ip}/tcp/{port}/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWLY6fVFhwCnGasVpGBToCSTq9DBeqH4PVQHKB6dEdKcRA"
-            ).parse().expect("static circuit multiaddr is valid");
-            let result = make_external_addr(&circuit, IpAddr::V4(external_ip));
-            prop_assert_eq!(result, None);
         }
 
         #[test]

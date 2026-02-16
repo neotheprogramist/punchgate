@@ -112,8 +112,7 @@ impl MealyMachine for TunnelState {
 
         match event {
             Event::PhaseChanged {
-                new: Phase::Participating,
-                ..
+                new: Phase::Ready, ..
             } => {
                 commands.push(Command::PublishServices);
                 commands.extend(self.initiate_lookups());
@@ -280,20 +279,20 @@ mod tests {
 
     proptest! {
         #[test]
-        fn phase_changed_to_participating_publishes(
+        fn phase_changed_to_ready_publishes(
             old in arb_phase(),
         ) {
-            prop_assume!(old != Phase::Participating);
+            prop_assume!(old != Phase::Ready);
             let state = TunnelState::new();
             let (_, commands) = state.transition(Event::PhaseChanged {
                 old,
-                new: Phase::Participating,
+                new: Phase::Ready,
             });
             prop_assert!(commands.contains(&Command::PublishServices));
         }
 
         #[test]
-        fn phase_changed_to_participating_initiates_lookups(
+        fn phase_changed_to_ready_initiates_lookups(
             old in arb_phase(),
             peer in arb_peer_id(),
             service in arb_service_name(),
@@ -301,14 +300,14 @@ mod tests {
             svc_name in arb_service_name(),
             svc_bind in arb_service_addr(),
         ) {
-            prop_assume!(old != Phase::Participating);
+            prop_assume!(old != Phase::Ready);
             let mut state = TunnelState::new();
             state.add_peer_tunnel(peer, service, bind);
             state.add_service_tunnel(svc_name.clone(), svc_bind);
 
             let (_, commands) = state.transition(Event::PhaseChanged {
                 old,
-                new: Phase::Participating,
+                new: Phase::Ready,
             });
 
             prop_assert!(commands.contains(&Command::PublishServices));
@@ -323,11 +322,11 @@ mod tests {
         }
 
         #[test]
-        fn phase_changed_non_participating_is_noop(
+        fn phase_changed_non_ready_is_noop(
             old in arb_phase(),
             new in arb_phase(),
         ) {
-            prop_assume!(new != Phase::Participating);
+            prop_assume!(new != Phase::Ready);
             let state = TunnelState::new();
             let (_, commands) = state.transition(Event::PhaseChanged { old, new });
             prop_assert!(commands.is_empty());

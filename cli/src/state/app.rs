@@ -70,16 +70,24 @@ mod tests {
 
     proptest! {
         #[test]
-        fn composition_publishes_on_participating_entry(
+        fn composition_publishes_on_ready_entry(
             peer in arb_peer_id(),
             addr in arb_multiaddr(),
+            external_addr in arb_multiaddr(),
         ) {
             let app = new_app();
             let (app, _) = app.transition(Event::BootstrapConnected { peer, addr });
-            prop_assert_eq!(app.phase(), Phase::Discovering);
+            prop_assert_eq!(app.phase(), Phase::Joining);
 
+            // ExternalAddrConfirmed alone stays Joining (no kad_bootstrapped)
+            let (app, _) = app.transition(Event::ExternalAddrConfirmed {
+                addr: external_addr,
+            });
+            prop_assert_eq!(app.phase(), Phase::Joining);
+
+            // KademliaBootstrapOk with external addrs triggers Ready + PublishServices
             let (app, commands) = app.transition(Event::KademliaBootstrapOk);
-            prop_assert_eq!(app.phase(), Phase::Participating);
+            prop_assert_eq!(app.phase(), Phase::Ready);
             prop_assert!(commands.contains(&Command::PublishServices));
         }
 
@@ -90,18 +98,13 @@ mod tests {
         ) {
             let app = new_app();
             let (app, _) = app.transition(Event::BootstrapConnected { peer, addr });
-            let (app, _) = app.transition(Event::KademliaBootstrapOk);
 
-            let relay_peer = app.peer.relay.clone();
-            match relay_peer {
-                crate::state::RelayState::Requesting { relay_peer } => {
-                    let (_, commands) = app.transition(Event::RelayReservationAccepted { relay_peer });
-                    prop_assert!(commands.contains(&Command::PublishServices));
-                }
-                _ => {
-                    // No relay was requested (no non-loopback addresses)
-                }
-            }
+            // Setup NatStatus::Private to trigger relay request
+            let (app, _) = app.transition(Event::NatStatusChanged(NatStatus::Private));
+
+            // Relay accepted always publishes services via TunnelState
+            let (_, commands) = app.transition(Event::RelayReservationAccepted { relay_peer: peer });
+            prop_assert!(commands.contains(&Command::PublishServices));
         }
 
         #[test]
@@ -140,7 +143,7 @@ mod tests {
             let _ = nat_status;
             let app = new_app();
             let (app, commands) = app.transition(Event::NoBootstrapPeers);
-            prop_assert_eq!(app.phase(), Phase::Participating);
+            prop_assert_eq!(app.phase(), Phase::Ready);
             prop_assert!(commands.contains(&Command::PublishServices));
         }
 
@@ -148,18 +151,21 @@ mod tests {
         fn peer_cmds_before_tunnel_cmds(
             peer in arb_peer_id(),
             addr in arb_multiaddr(),
+            external_addr in arb_multiaddr(),
         ) {
             let app = new_app();
             let (app, _) = app.transition(Event::BootstrapConnected { peer, addr });
+            let (app, _) = app.transition(Event::ExternalAddrConfirmed {
+                addr: external_addr,
+            });
             let (_, commands) = app.transition(Event::KademliaBootstrapOk);
 
-            // Peer commands (KademliaBootstrap, RequestRelayReservation) come
-            // before tunnel commands (PublishServices) in the output
+            // Peer commands come before tunnel commands (PublishServices) in the output
             let publish_idx = commands.iter().position(|c| matches!(c, Command::PublishServices));
-            let relay_idx = commands.iter().position(|c| matches!(c, Command::RequestRelayReservation { .. }));
+            let kad_idx = commands.iter().position(|c| matches!(c, Command::KademliaBootstrap | Command::KademliaAddAddress { .. }));
 
-            if let (Some(relay), Some(publish)) = (relay_idx, publish_idx) {
-                prop_assert!(relay < publish, "peer commands must precede tunnel commands");
+            if let (Some(kad), Some(publish)) = (kad_idx, publish_idx) {
+                prop_assert!(kad < publish, "peer commands must precede tunnel commands");
             }
         }
     }

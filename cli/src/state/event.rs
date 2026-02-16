@@ -27,6 +27,7 @@ pub enum Event {
     PeerIdentified {
         peer: PeerId,
         listen_addrs: Vec<Multiaddr>,
+        observed_addr: Multiaddr,
     },
     NatStatusChanged(NatStatus),
     DiscoveryTimeout,

@@ -164,6 +164,7 @@ fn translate_behaviour_event(
             vec![Event::PeerIdentified {
                 peer: *peer_id,
                 listen_addrs: info.listen_addrs.clone(),
+                observed_addr: info.observed_addr.clone(),
             }]
         }
         // identify::Event is #[non_exhaustive] — wildcard covers Sent, Pushed, Error

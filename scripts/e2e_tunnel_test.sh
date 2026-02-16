@@ -18,10 +18,9 @@
 #   Terminal 1 (bootstrap, public IP):
 #     ./punchgate --listen /ip4/0.0.0.0/tcp/4001
 #
-#   Terminal 2 (workhorse, behind NAT):
+#   Terminal 2 (workhorse, behind NAT — node detects NAT status via AutoNAT):
 #     ./punchgate \
 #       --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
-#       --nat-status private \
 #       --expose ssh=127.0.0.1:22
 #
 #   Terminal 3 (client, behind NAT or public):

@@ -4,7 +4,7 @@ use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use proptest::prelude::*;
 
 use crate::{
-    state::{NatStatus, Phase, RelayState},
+    state::{NatStatus, Phase},
     types::{HostAddr, ServiceName},
 };
 
@@ -76,9 +76,8 @@ pub fn arb_relay_circuit_multiaddr() -> impl Strategy<Value = Multiaddr> {
 
 pub fn arb_phase() -> impl Strategy<Value = Phase> {
     prop_oneof![
-        Just(Phase::Initializing),
-        Just(Phase::Discovering),
-        Just(Phase::Participating),
+        Just(Phase::Joining),
+        Just(Phase::Ready),
         Just(Phase::ShuttingDown),
     ]
 }
@@ -88,14 +87,6 @@ pub fn arb_nat_status() -> impl Strategy<Value = NatStatus> {
         Just(NatStatus::Unknown),
         Just(NatStatus::Public),
         Just(NatStatus::Private),
-    ]
-}
-
-pub fn arb_relay_state() -> impl Strategy<Value = RelayState> {
-    prop_oneof![
-        Just(RelayState::Idle),
-        arb_peer_id().prop_map(|peer| RelayState::Requesting { relay_peer: peer }),
-        arb_peer_id().prop_map(|peer| RelayState::Reserved { relay_peer: peer }),
     ]
 }
 

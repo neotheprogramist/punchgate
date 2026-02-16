@@ -74,7 +74,6 @@ services:
         ipv4_address: 10.100.0.10
     environment:
       PUNCHGATE_LISTEN: "/ip4/0.0.0.0/udp/4001/quic-v1"
-      PUNCHGATE_EXTERNAL_ADDRESS: "10.100.0.10"
 
   workhorse:
     build:
@@ -96,7 +95,6 @@ services:
       PUNCHGATE_BOOTSTRAP: "/ip4/10.100.0.10/udp/4001/quic-v1/p2p/${BOOTSTRAP_ID}"
       PUNCHGATE_EXPOSE: "echo=10.0.1.20:7777"
       PUNCHGATE_GATEWAY: "10.0.1.2"
-      PUNCHGATE_EXTERNAL_ADDRESS: "10.100.0.11"
       RUST_LOG: "cli=info"
 
   client:
@@ -118,7 +116,6 @@ services:
       PUNCHGATE_BOOTSTRAP: "/ip4/10.100.0.10/udp/4001/quic-v1/p2p/${BOOTSTRAP_ID}"
       PUNCHGATE_TUNNEL_BY_NAME: "echo@0.0.0.0:2222"
       PUNCHGATE_GATEWAY: "10.0.2.2"
-      PUNCHGATE_EXTERNAL_ADDRESS: "10.100.0.12"
       RUST_LOG: "cli=info"
 
   test-probe:

@@ -1,4 +1,4 @@
-use std::{net::IpAddr, path::PathBuf};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
@@ -41,10 +41,6 @@ struct Cli {
     /// Tunnel to a service by name (discovers provider via DHT): service_name@bind_addr
     #[arg(long, env = "PUNCHGATE_TUNNEL_BY_NAME", value_delimiter = ',')]
     tunnel_by_name: Vec<TunnelByNameSpec>,
-
-    /// Override external IP address (skip automatic discovery).
-    #[arg(long, env = "PUNCHGATE_EXTERNAL_ADDRESS")]
-    external_address: Option<IpAddr>,
 }
 
 #[tokio::main]
@@ -64,7 +60,6 @@ async fn main() -> Result<()> {
         exposed: cli.expose,
         tunnel_specs: cli.tunnel,
         tunnel_by_name_specs: cli.tunnel_by_name,
-        external_address: cli.external_address,
     })
     .await
 }
