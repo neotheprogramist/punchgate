@@ -12,11 +12,7 @@ use std::{
 
 use anyhow::Result;
 use futures::StreamExt;
-use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, noise,
-    swarm::{self, NetworkBehaviour, SwarmEvent},
-    yamux,
-};
+use libp2p::{Multiaddr, PeerId, SwarmBuilder, noise, swarm::SwarmEvent, yamux};
 
 use self::{
     backoff::ReconnectBackoff,
@@ -167,17 +163,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 if let SwarmEvent::NewListenAddr { address, .. } = &event {
                     tracing::info!("listening on {address}");
                     if let Some(ext_addr) = external_addr::make_external_addr(address, external_ip) {
-                        tracing::info!(%ext_addr, "registering external address");
-                        swarm.add_external_address(ext_addr.clone());
-                        // The swarm suppresses NewExternalAddrCandidate for addresses
-                        // already in its confirmed set (libp2p-swarm lib.rs:1135).
-                        // DCUtR only populates hole-punch candidates from that event,
-                        // so we inject the address directly into the DCUtR behaviour.
-                        swarm.behaviour_mut().dcutr.on_swarm_event(
-                            swarm::FromSwarm::NewExternalAddrCandidate(
-                                swarm::NewExternalAddrCandidate { addr: &ext_addr },
-                            ),
-                        );
+                        tracing::info!(%ext_addr, "registering external address for DHT");
+                        swarm.add_external_address(ext_addr);
                     }
                 }
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
