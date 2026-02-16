@@ -9,7 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1.0.101"
 clap = { version = "4.5.58", features = ["derive", "env"] }
-futures = "0.3.31"
+futures = "0.3.32"
 libp2p = { version = "0.56.0", features = [
     "autonat",
     "dcutr",
@@ -22,7 +22,6 @@ libp2p = { version = "0.56.0", features = [
     "quic",
     "relay",
     "serde",
-    "tcp",
     "tokio",
     "yamux",
 ] }
@@ -30,7 +29,7 @@ libp2p-stream = "0.4.0-alpha"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 itertools = "0.14.0"
-reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+reqwest = "0.13.2"
 proptest = "1.10.0"
 tempfile = "3.25.0"
 strum = { version = "0.27.2", features = ["derive"] }

@@ -48,7 +48,7 @@ You should see the echo server logging that it's listening. Leave it running.
 ```bash
 cargo run -p cli -- \
   --identity /tmp/peer-b.key \
-  --listen /ip4/127.0.0.1/tcp/0 \
+  --listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --expose echo=127.0.0.1:7777
 ```
 
@@ -56,7 +56,7 @@ Note the peer ID and listening address printed by Peer B, e.g.:
 
 ```
 INFO cli::identity: generated new identity peer_id=12D3KooW...
-INFO cli::node:     listening on /ip4/127.0.0.1/tcp/54321
+INFO cli::node:     listening on /ip4/127.0.0.1/udp/54321/quic-v1
 ```
 
 **Terminal 3 — Start Peer A, tunnel to Peer B's echo service:**
@@ -66,7 +66,7 @@ Replace `<PEER_B_ID>` and `<PEER_B_ADDR>` with the values from Terminal 2:
 ```bash
 cargo run -p cli -- \
   --identity /tmp/peer-a.key \
-  --listen /ip4/127.0.0.1/tcp/0 \
+  --listen /ip4/127.0.0.1/udp/0/quic-v1 \
   --bootstrap <PEER_B_ADDR>/p2p/<PEER_B_ID> \
   --tunnel <PEER_B_ID>:echo@127.0.0.1:9000
 ```
@@ -119,14 +119,14 @@ The full NAT traversal flow connects a client to a service behind NAT via a publ
 
 ```bash
 cargo run -p cli -- \
-  --listen /ip4/0.0.0.0/tcp/4001
+  --listen /ip4/0.0.0.0/udp/4001/quic-v1
 ```
 
 **Node 2 — Workhorse (behind NAT, exposes SSH):**
 
 ```bash
 cargo run -p cli -- \
-  --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
+  --bootstrap /ip4/<BOOTSTRAP_IP>/udp/4001/quic-v1/p2p/<BOOTSTRAP_ID> \
   --expose ssh=127.0.0.1:22
 ```
 
@@ -136,7 +136,7 @@ Relay reservation is automatic. The workhorse connects to the bootstrap node, im
 
 ```bash
 cargo run -p cli -- \
-  --bootstrap /ip4/<BOOTSTRAP_IP>/tcp/4001/p2p/<BOOTSTRAP_ID> \
+  --bootstrap /ip4/<BOOTSTRAP_IP>/udp/4001/quic-v1/p2p/<BOOTSTRAP_ID> \
   --tunnel <WORKHORSE_ID>:ssh@127.0.0.1:2222
 ```
 
@@ -195,7 +195,7 @@ Punchgate emits structured `tracing` events at every observation point — conne
 ```bash
 cargo run -p cli -- \
   --identity peer.key \
-  --listen /ip4/0.0.0.0/tcp/0 \
+  --listen /ip4/0.0.0.0/udp/0/quic-v1 \
   2> logs/my-peer.log
 ```
 
@@ -230,13 +230,13 @@ python scripts/log_phases.py        # → logs/phases.txt
 
 ## Configuration
 
-| Flag                      | Default              | Description                             |
-| ------------------------- | -------------------- | --------------------------------------- |
-| `--identity PATH`         | `identity.key`       | Persistent Ed25519 keypair file         |
-| `--listen MULTIADDR`      | `/ip4/0.0.0.0/tcp/0` | Address(es) to listen on                |
-| `--bootstrap MULTIADDR`   | _(none)_             | Peer(s) to dial on startup              |
-| `--expose NAME=HOST:PORT` | _(none)_             | Expose a local TCP service to the mesh  |
-| `--tunnel PEER:SVC@BIND`  | _(none)_             | Tunnel a remote service to a local port |
+| Flag                      | Default                      | Description                             |
+| ------------------------- | ---------------------------- | --------------------------------------- |
+| `--identity PATH`         | `identity.key`               | Persistent Ed25519 keypair file         |
+| `--listen MULTIADDR`      | `/ip4/0.0.0.0/udp/0/quic-v1` | Address(es) to listen on                |
+| `--bootstrap MULTIADDR`   | _(none)_                     | Peer(s) to dial on startup              |
+| `--expose NAME=HOST:PORT` | _(none)_                     | Expose a local TCP service to the mesh  |
+| `--tunnel PEER:SVC@BIND`  | _(none)_                     | Tunnel a remote service to a local port |
 
 Environment: `PUNCHGATE_IDENTITY` overrides `--identity`. `RUST_LOG` controls log verbosity (default: `info`).
 

@@ -30,8 +30,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM alpine:3.21 AS runtime
 ARG APP_NAME
-RUN apk add --no-cache su-exec
+RUN apk add --no-cache iproute2 iptables su-exec
 RUN adduser -D punchgate
 COPY --from=builder "/app/target/release/${APP_NAME}" /usr/local/bin/punchgate
+COPY scripts/container-entrypoint.sh /usr/local/bin/container-entrypoint.sh
+RUN chmod +x /usr/local/bin/container-entrypoint.sh
 WORKDIR /home/punchgate
-ENTRYPOINT [ "su-exec", "punchgate", "/usr/local/bin/punchgate" ]
+ENTRYPOINT [ "/usr/local/bin/container-entrypoint.sh" ]

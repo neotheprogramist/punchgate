@@ -4,8 +4,7 @@ use futures::StreamExt;
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
 use libp2p::{
-    Multiaddr, PeerId, SwarmBuilder, identify, identity::Keypair, kad, noise, swarm::SwarmEvent,
-    yamux,
+    Multiaddr, PeerId, SwarmBuilder, identify, identity::Keypair, kad, swarm::SwarmEvent,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,12 +20,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_tcp(
-            Default::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
-        .expect("build TCP transport")
+        .with_quic()
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
 
@@ -61,7 +55,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
     let control = swarm.behaviour().stream.new_control();
     swarm
         .listen_on(
-            "/ip4/127.0.0.1/tcp/0"
+            "/ip4/127.0.0.1/udp/0/quic-v1"
                 .parse()
                 .expect("parse listen multiaddr"),
         )
@@ -77,12 +71,7 @@ fn build_test_swarm_with_keypair(
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
-        .with_tcp(
-            Default::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
-        .expect("build TCP transport")
+        .with_quic()
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
 
@@ -117,7 +106,7 @@ fn build_test_swarm_with_keypair(
     let control = swarm.behaviour().stream.new_control();
     swarm
         .listen_on(
-            "/ip4/127.0.0.1/tcp/0"
+            "/ip4/127.0.0.1/udp/0/quic-v1"
                 .parse()
                 .expect("parse listen multiaddr"),
         )

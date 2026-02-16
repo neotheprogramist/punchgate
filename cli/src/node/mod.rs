@@ -4,6 +4,7 @@ mod translate;
 
 use std::{
     collections::{HashMap, HashSet},
+    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -11,7 +12,11 @@ use std::{
 
 use anyhow::Result;
 use futures::StreamExt;
-use libp2p::{Multiaddr, PeerId, SwarmBuilder, noise, swarm::SwarmEvent, yamux};
+use libp2p::{
+    Multiaddr, PeerId, SwarmBuilder, noise,
+    swarm::{self, NetworkBehaviour, SwarmEvent},
+    yamux,
+};
 
 use self::{
     backoff::ReconnectBackoff,
@@ -39,6 +44,7 @@ pub struct NodeConfig {
     pub exposed: Vec<ExposedService>,
     pub tunnel_specs: Vec<TunnelSpec>,
     pub tunnel_by_name_specs: Vec<TunnelByNameSpec>,
+    pub external_address: Option<IpAddr>,
 }
 
 pub async fn run(config: NodeConfig) -> Result<()> {
@@ -67,11 +73,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
-        .with_tcp(
-            Default::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
         .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(
@@ -82,10 +83,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build();
 
-    tracing::info!("discovering external IP address...");
-    let external_ip = external_addr::discover_external_ip().await.ok_or_else(|| {
-        anyhow::anyhow!("failed to discover external IP address — all services unreachable")
-    })?;
+    let external_ip = match config.external_address {
+        Some(ip) => {
+            tracing::info!(%ip, "using provided external IP address");
+            ip
+        }
+        None => {
+            tracing::info!("discovering external IP address...");
+            external_addr::discover_external_ip().await.ok_or_else(|| {
+                anyhow::anyhow!("failed to discover external IP address — all services unreachable")
+            })?
+        }
+    };
 
     let mut stream_control = swarm.behaviour().stream.new_control();
     let incoming = stream_control
@@ -159,7 +168,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     tracing::info!("listening on {address}");
                     if let Some(ext_addr) = external_addr::make_external_addr(address, external_ip) {
                         tracing::info!(%ext_addr, "registering external address");
-                        swarm.add_external_address(ext_addr);
+                        swarm.add_external_address(ext_addr.clone());
+                        // The swarm suppresses NewExternalAddrCandidate for addresses
+                        // already in its confirmed set (libp2p-swarm lib.rs:1135).
+                        // DCUtR only populates hole-punch candidates from that event,
+                        // so we inject the address directly into the DCUtR behaviour.
+                        swarm.behaviour_mut().dcutr.on_swarm_event(
+                            swarm::FromSwarm::NewExternalAddrCandidate(
+                                swarm::NewExternalAddrCandidate { addr: &ext_addr },
+                            ),
+                        );
                     }
                 }
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
@@ -204,6 +222,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
 
                 if let SwarmEvent::NewExternalAddrCandidate { address } = &event {
+                    tracing::info!(%address, "new external address candidate (confirming)");
                     swarm.add_external_address(address.clone());
                 }
 
@@ -226,7 +245,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
                         }
                         Event::HolePunchFailed { remote_peer, reason } => {
-                            tracing::warn!(peer = %remote_peer, %reason, "hole punch failed");
+                            let ext_addrs: Vec<_> = swarm.external_addresses().collect();
+                            tracing::warn!(peer = %remote_peer, %reason, external_addrs = ?ext_addrs, "hole punch failed");
                         }
                         _ => {}
                     }

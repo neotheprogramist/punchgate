@@ -162,19 +162,19 @@ log "echo server ready (pid ${PIDS[-1]})"
 log "starting peer B (expose echo=127.0.0.1:$ECHO_PORT)..."
 RUST_LOG="${RUST_LOG:-cli=debug}" "$BINARY" \
     --identity "$PEER_B_KEY" \
-    --listen /ip4/127.0.0.1/tcp/0 \
+    --listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --expose "echo=127.0.0.1:$ECHO_PORT" \
     > "$PEER_B_LOG" 2>&1 &
 PIDS+=($!)
 
-wait_for_log "$PEER_B_LOG" "listening on /ip4/127.0.0.1/tcp/" "peer B listening"
+wait_for_log "$PEER_B_LOG" "listening on /ip4/127.0.0.1/udp/" "peer B listening"
 log "peer B ready (pid ${PIDS[-1]})"
 
 # Parse Peer B's ID and listening address (strip ANSI codes first)
 PEER_B_LOG_CLEAN="$TMPDIR/peer-b-clean.log"
 sed 's/\x1b\[[0-9;]*m//g' "$PEER_B_LOG" > "$PEER_B_LOG_CLEAN"
 PEER_B_ID=$(grep -o 'local_peer_id=[^ ]*' "$PEER_B_LOG_CLEAN" | head -1 | cut -d= -f2)
-PEER_B_ADDR=$(grep -o 'listening on /ip4/127.0.0.1/tcp/[0-9]*' "$PEER_B_LOG_CLEAN" | head -1 | sed 's/listening on //')
+PEER_B_ADDR=$(grep -o 'listening on /ip4/127.0.0.1/udp/[0-9]*/quic-v1' "$PEER_B_LOG_CLEAN" | head -1 | sed 's/listening on //')
 
 if [[ -z "$PEER_B_ID" || -z "$PEER_B_ADDR" ]]; then
     TEST_FAILED=1
@@ -192,13 +192,13 @@ TUNNEL_SPEC="$PEER_B_ID:echo@127.0.0.1:$TUNNEL_BIND_PORT"
 log "starting peer A (tunnel $TUNNEL_SPEC)..."
 RUST_LOG="${RUST_LOG:-cli=debug}" "$BINARY" \
     --identity "$PEER_A_KEY" \
-    --listen /ip4/127.0.0.1/tcp/0 \
+    --listen /ip4/127.0.0.1/udp/0/quic-v1 \
     --bootstrap "$BOOTSTRAP" \
     --tunnel "$TUNNEL_SPEC" \
     > "$PEER_A_LOG" 2>&1 &
 PIDS+=($!)
 
-wait_for_log "$PEER_A_LOG" "listening on /ip4/127.0.0.1/tcp/" "peer A listening"
+wait_for_log "$PEER_A_LOG" "listening on /ip4/127.0.0.1/udp/" "peer A listening"
 log "peer A ready (pid ${PIDS[-1]})"
 
 # Wait for Peer A to establish the tunnel listener

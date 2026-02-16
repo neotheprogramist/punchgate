@@ -53,7 +53,15 @@ fn needs_external_rewrite(ip: Ipv4Addr) -> bool {
     ip.is_unspecified() || ip.is_private() || ip.is_loopback()
 }
 
+fn is_circuit_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+}
+
 pub fn make_external_addr(listen_addr: &Multiaddr, external_ip: IpAddr) -> Option<Multiaddr> {
+    if is_circuit_addr(listen_addr) {
+        return None;
+    }
+
     let mut rewritten = false;
     let new_addr = listen_addr
         .iter()
@@ -172,6 +180,19 @@ mod tests {
         #[test]
         fn no_rewrite_for_public_ips(ip in arb_external_ipv4()) {
             prop_assert!(!needs_external_rewrite(ip));
+        }
+
+        #[test]
+        fn skips_relay_circuit_addr(
+            relay_ip in arb_private_ipv4(),
+            external_ip in arb_external_ipv4(),
+            port in arb_port(),
+        ) {
+            let circuit: Multiaddr = format!(
+                "/ip4/{relay_ip}/tcp/{port}/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit/p2p/12D3KooWLY6fVFhwCnGasVpGBToCSTq9DBeqH4PVQHKB6dEdKcRA"
+            ).parse().expect("static circuit multiaddr is valid");
+            let result = make_external_addr(&circuit, IpAddr::V4(external_ip));
+            prop_assert_eq!(result, None);
         }
     }
 }
