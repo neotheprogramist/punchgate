@@ -57,6 +57,18 @@ fn is_circuit_addr(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
 }
 
+fn has_public_ip(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => !needs_external_rewrite(ip),
+        Protocol::Ip6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+        _ => false,
+    })
+}
+
+pub fn is_valid_external_candidate(addr: &Multiaddr) -> bool {
+    !is_circuit_addr(addr) && has_public_ip(addr)
+}
+
 pub fn make_external_addr(listen_addr: &Multiaddr, external_ip: IpAddr) -> Option<Multiaddr> {
     if is_circuit_addr(listen_addr) {
         return None;
@@ -193,6 +205,48 @@ mod tests {
             ).parse().expect("static circuit multiaddr is valid");
             let result = make_external_addr(&circuit, IpAddr::V4(external_ip));
             prop_assert_eq!(result, None);
+        }
+
+        #[test]
+        fn valid_candidate_accepts_public_direct_addr(
+            ip in arb_external_ipv4(),
+            port in arb_port(),
+        ) {
+            let addr: Multiaddr = format!("/ip4/{ip}/udp/{port}/quic-v1")
+                .parse().expect("static format produces valid multiaddr");
+            prop_assert!(is_valid_external_candidate(&addr));
+        }
+
+        #[test]
+        fn valid_candidate_rejects_circuit_addr(
+            ip in arb_external_ipv4(),
+            port in arb_port(),
+        ) {
+            let addr: Multiaddr = format!(
+                "/ip4/{ip}/udp/{port}/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN/p2p-circuit"
+            ).parse().expect("static circuit multiaddr is valid");
+            prop_assert!(!is_valid_external_candidate(&addr));
+        }
+
+        #[test]
+        fn valid_candidate_rejects_private_ip(
+            ip in arb_private_ipv4(),
+            port in arb_port(),
+        ) {
+            let addr: Multiaddr = format!("/ip4/{ip}/udp/{port}/quic-v1")
+                .parse().expect("static format produces valid multiaddr");
+            prop_assert!(!is_valid_external_candidate(&addr));
+        }
+
+        #[test]
+        fn valid_candidate_rejects_bare_peer_id(
+            ip in arb_external_ipv4(),
+        ) {
+            // Bare /p2p/ address has no IP — should be rejected
+            let _ = ip; // use the generated value to satisfy proptest
+            let addr: Multiaddr = "/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+                .parse().expect("static peer ID multiaddr is valid");
+            prop_assert!(!is_valid_external_candidate(&addr));
         }
     }
 }

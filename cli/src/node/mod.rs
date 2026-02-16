@@ -222,8 +222,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
 
                 if let SwarmEvent::NewExternalAddrCandidate { address } = &event {
-                    tracing::info!(%address, "new external address candidate (confirming)");
-                    swarm.add_external_address(address.clone());
+                    if external_addr::is_valid_external_candidate(address) {
+                        tracing::info!(%address, "new external address candidate (confirming)");
+                        swarm.add_external_address(address.clone());
+                    } else {
+                        tracing::debug!(%address, "ignoring invalid external address candidate");
+                    }
                 }
 
                 // Translate swarm event → domain events, then feed through state machine
