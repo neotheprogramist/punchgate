@@ -1,14 +1,14 @@
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "autonat")]
+use libp2p::autonat;
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
-use libp2p::{PeerId, autonat, identify, kad, ping, relay, swarm::SwarmEvent};
+use libp2p::{Multiaddr, PeerId, identify, kad, ping, relay, swarm::SwarmEvent};
 
-use crate::{
-    behaviour::BehaviourEvent,
-    state::{Event, NatStatus},
-    types::ServiceName,
-};
+#[cfg(feature = "autonat")]
+use crate::state::NatStatus;
+use crate::{behaviour::BehaviourEvent, state::Event, types::ServiceName};
 
 pub fn translate_swarm_event(
     event: &SwarmEvent<BehaviourEvent>,
@@ -66,8 +66,22 @@ pub fn translate_swarm_event(
         SwarmEvent::ListenerError { error, .. } => {
             tracing::warn!(error = %error, "listener error");
         }
-        SwarmEvent::ListenerClosed { reason, .. } => {
+        SwarmEvent::ListenerClosed {
+            reason, addresses, ..
+        } => {
             tracing::info!(reason = ?reason, "listener closed");
+            if reason.is_err()
+                && let Some(relay_peer) = extract_relay_peer_from_addrs(addresses)
+            {
+                let reason_str = match reason {
+                    Err(e) => e.to_string(),
+                    Ok(()) => "unknown".to_string(),
+                };
+                events.push(Event::RelayReservationFailed {
+                    relay_peer,
+                    reason: reason_str,
+                });
+            }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             tracing::warn!(peer = ?peer_id, error = %error, "outgoing connection error");
@@ -170,6 +184,7 @@ fn translate_behaviour_event(
         // identify::Event is #[non_exhaustive] — wildcard covers Sent, Pushed, Error
         BehaviourEvent::Identify(_) => vec![],
 
+        #[cfg(feature = "autonat")]
         BehaviourEvent::Autonat(autonat::Event::StatusChanged { new, .. }) => {
             let status = match new {
                 autonat::NatStatus::Public(_) => NatStatus::Public,
@@ -179,6 +194,7 @@ fn translate_behaviour_event(
             vec![Event::NatStatusChanged(status)]
         }
         // autonat::Event is #[non_exhaustive] — wildcard covers InboundProbe, OutboundProbe
+        #[cfg(feature = "autonat")]
         BehaviourEvent::Autonat(_) => vec![],
 
         BehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted {
@@ -257,6 +273,24 @@ fn translate_get_providers(
             None => vec![],
         },
     }
+}
+
+fn extract_relay_peer_from_addrs(addrs: &[Multiaddr]) -> Option<PeerId> {
+    addrs.iter().find_map(|addr| {
+        let mut peer = None;
+        let mut has_circuit = false;
+        for proto in addr.iter() {
+            match proto {
+                libp2p::multiaddr::Protocol::P2p(pid) => peer = Some(pid),
+                libp2p::multiaddr::Protocol::P2pCircuit => has_circuit = true,
+                _ => {}
+            }
+        }
+        match has_circuit {
+            true => peer,
+            false => None,
+        }
+    })
 }
 
 fn is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {

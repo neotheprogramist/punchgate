@@ -1,10 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    str::FromStr,
-};
+use std::collections::{HashMap, HashSet};
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
-use thiserror::Error;
 
 use super::{command::Command, event::Event};
 use crate::traits::MealyMachine;
@@ -43,22 +39,6 @@ pub enum NatStatus {
     Private,
 }
 
-#[derive(Debug, Error)]
-#[error("invalid NAT status '{0}': must be 'private' or 'public'")]
-pub struct NatStatusParseError(String);
-
-impl FromStr for NatStatus {
-    type Err = NatStatusParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "private" => Ok(NatStatus::Private),
-            "public" => Ok(NatStatus::Public),
-            other => Err(NatStatusParseError(other.to_string())),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerState {
     pub phase: Phase,
@@ -86,6 +66,22 @@ impl PeerState {
             bootstrap_peers: HashSet::new(),
             kad_bootstrapped: false,
             external_addrs: HashSet::new(),
+        }
+    }
+
+    fn maybe_request_relay(&self) -> Option<Command> {
+        match (self.nat_status, self.relay_reserved) {
+            (NatStatus::Private, false) => self
+                .known_peers
+                .iter()
+                .find(|(p, _)| self.bootstrap_peers.contains(p))
+                .and_then(|(&peer, addrs)| {
+                    prefer_non_loopback(addrs).map(|addr| Command::RequestRelayReservation {
+                        relay_peer: peer,
+                        relay_addr: addr.clone(),
+                    })
+                }),
+            _ => None,
         }
     }
 
@@ -129,6 +125,10 @@ impl MealyMachine for PeerState {
                     }
                     Phase::ShuttingDown => {}
                 }
+                // Relay request deferred to PeerIdentified — requesting relay on
+                // BootstrapConnected races with the bootstrap's own Identify
+                // exchange, arriving before the relay server learns its external
+                // addresses (NoAddressesInReservation).
             }
 
             Event::KademliaBootstrapOk => {
@@ -144,19 +144,7 @@ impl MealyMachine for PeerState {
                 self.nat_status = status;
                 match (status, self.relay_reserved) {
                     (NatStatus::Private, false) => {
-                        let relay_candidate = self
-                            .known_peers
-                            .iter()
-                            .find(|(p, _)| self.bootstrap_peers.contains(p))
-                            .and_then(|(&peer, addrs)| {
-                                prefer_non_loopback(addrs).map(|addr| (peer, addr.clone()))
-                            });
-                        if let Some((relay_peer, relay_addr)) = relay_candidate {
-                            commands.push(Command::RequestRelayReservation {
-                                relay_peer,
-                                relay_addr,
-                            });
-                        }
+                        commands.extend(self.maybe_request_relay());
                     }
                     (NatStatus::Public, true) => {
                         self.relay_reserved = false;
@@ -211,6 +199,9 @@ impl MealyMachine for PeerState {
                         addr: addr.clone(),
                     });
                 }
+                if self.bootstrap_peers.contains(&peer) {
+                    commands.extend(self.maybe_request_relay());
+                }
             }
 
             Event::RelayReservationAccepted { .. } => {
@@ -219,10 +210,12 @@ impl MealyMachine for PeerState {
 
             Event::RelayReservationFailed { .. } => {
                 self.relay_reserved = false;
+                commands.extend(self.maybe_request_relay());
             }
 
             Event::HolePunchSucceeded { .. }
             | Event::HolePunchFailed { .. }
+            | Event::HolePunchTimeout { .. }
             | Event::DhtPeerLookupComplete { .. }
             | Event::DhtServiceResolved { .. }
             | Event::DhtServiceFailed { .. }
@@ -766,22 +759,6 @@ mod tests {
             prop_assert_eq!(s4.phase, phase);
             prop_assert_eq!(s4.nat_status, nat_status);
             prop_assert!(c4.is_empty());
-        }
-
-        #[test]
-        fn nat_status_fromstr_roundtrip(
-            status in prop_oneof![Just(NatStatus::Public), Just(NatStatus::Private)],
-        ) {
-            let s = status.to_string();
-            let parsed: NatStatus = s.parse().expect("parse valid NatStatus string");
-            prop_assert_eq!(parsed, status);
-        }
-
-        #[test]
-        fn nat_status_fromstr_rejects_invalid(s in "[a-z]{1,10}") {
-            prop_assume!(s != "private" && s != "public");
-            let result: Result<NatStatus, _> = s.parse();
-            prop_assert!(result.is_err());
         }
 
         #[test]

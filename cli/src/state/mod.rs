@@ -7,5 +7,5 @@ pub mod tunnel;
 pub use app::AppState;
 pub use command::Command;
 pub use event::Event;
-pub use peer::{NatStatus, NatStatusParseError, PeerState, Phase};
+pub use peer::{NatStatus, PeerState, Phase};
 pub use tunnel::TunnelState;

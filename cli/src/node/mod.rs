@@ -21,10 +21,10 @@ use self::{
 use crate::{
     behaviour::Behaviour,
     external_addr,
-    protocol::{self, DISCOVERY_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
+    protocol::{self, DISCOVERY_TIMEOUT, HOLEPUNCH_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
     shutdown,
     specs::{ExposedService, ServiceAddr, TunnelByNameSpec, TunnelSpec},
-    state::{AppState, Event, PeerState, Phase, TunnelState},
+    state::{AppState, Command, Event, NatStatus, PeerState, Phase, TunnelState},
     traits::MealyMachine,
     tunnel::TunnelRegistry,
     types::ServiceName,
@@ -127,6 +127,15 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
     }
 
+    if !config.bootstrap_addrs.is_empty() {
+        let old_phase = app_state.phase();
+        let (new_state, commands) =
+            app_state.transition(Event::NatStatusChanged(NatStatus::Private));
+        log_phase_transition(old_phase, new_state.phase(), commands.len());
+        app_state = new_state;
+        execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+    }
+
     let discovery_deadline = tokio::time::sleep(DISCOVERY_TIMEOUT);
     tokio::pin!(discovery_deadline);
     let mut discovery_timeout_fired = false;
@@ -136,12 +145,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+    let mut holepunch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
     let shutdown_signal = shutdown::shutdown_signal();
     tokio::pin!(shutdown_signal);
 
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
+        let next_holepunch = holepunch_deadlines.values().min().copied();
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -223,10 +234,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         }
                         Event::HolePunchSucceeded { remote_peer } => {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
+                            holepunch_deadlines.remove(remote_peer);
                         }
-                        Event::HolePunchFailed { remote_peer, reason } => {
+                        Event::HolePunchFailed { remote_peer, .. } => {
                             let ext_addrs: Vec<_> = swarm.external_addresses().collect();
-                            tracing::warn!(peer = %remote_peer, %reason, external_addrs = ?ext_addrs, "hole punch failed");
+                            tracing::warn!(peer = %remote_peer, external_addrs = ?ext_addrs, "hole punch failed");
+                            holepunch_deadlines.remove(remote_peer);
+                        }
+                        Event::TunnelPeerConnected { peer, relayed: false } => {
+                            holepunch_deadlines.remove(peer);
+                        }
+                        Event::ConnectionLost { peer, remaining_connections: 0 } => {
+                            holepunch_deadlines.remove(peer);
                         }
                         _ => {}
                     }
@@ -237,6 +256,13 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     log_phase_transition(old_phase, new_state.phase(), commands.len());
                     app_state = new_state;
                     execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+
+                    for cmd in &commands {
+                        if let Command::AwaitHolePunch { peer } = cmd {
+                            holepunch_deadlines.entry(*peer)
+                                .or_insert(tokio::time::Instant::now() + HOLEPUNCH_TIMEOUT);
+                        }
+                    }
 
                     match app_state.phase() {
                         Phase::ShuttingDown => {
@@ -294,6 +320,30 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+            _ = async {
+                match next_holepunch {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let now = tokio::time::Instant::now();
+                let due: Vec<PeerId> = holepunch_deadlines
+                    .iter()
+                    .filter(|(_, deadline)| **deadline <= now)
+                    .map(|(pid, _)| *pid)
+                    .collect();
+
+                for peer in due {
+                    holepunch_deadlines.remove(&peer);
+                    tracing::info!(%peer, "hole punch timeout, falling back to relay");
+                    let old_phase = app_state.phase();
+                    let (new_state, commands) = app_state.transition(Event::HolePunchTimeout { peer });
+                    tracing::debug!(event = "HolePunchTimeout", commands = commands.len(), "event processed");
+                    log_phase_transition(old_phase, new_state.phase(), commands.len());
+                    app_state = new_state;
+                    execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
                 }
             }
             _ = &mut shutdown_signal => {

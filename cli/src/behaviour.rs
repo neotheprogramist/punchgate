@@ -1,8 +1,10 @@
 use anyhow::Result;
+#[cfg(feature = "autonat")]
+use libp2p::autonat;
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
 use libp2p::{
-    PeerId, autonat, dcutr, identify, identity::Keypair, kad, ping, relay, swarm::NetworkBehaviour,
+    PeerId, dcutr, identify, identity::Keypair, kad, ping, relay, swarm::NetworkBehaviour,
 };
 
 use crate::protocol;
@@ -16,6 +18,7 @@ pub struct Behaviour {
     pub relay_client: relay::client::Behaviour,
     pub dcutr: dcutr::Behaviour,
     pub identify: identify::Behaviour,
+    #[cfg(feature = "autonat")]
     pub autonat: autonat::Behaviour,
     pub ping: ping::Behaviour,
     pub stream: libp2p_stream::Behaviour,
@@ -39,7 +42,8 @@ impl Behaviour {
             keypair.public(),
         ));
 
-        let autonat = autonat::Behaviour::new(peer_id, Default::default());
+        #[cfg(feature = "autonat")]
+        let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
 
         Ok(Self {
             kademlia,
@@ -49,6 +53,7 @@ impl Behaviour {
             relay_client,
             dcutr: dcutr::Behaviour::new(peer_id),
             identify,
+            #[cfg(feature = "autonat")]
             autonat,
             ping: ping::Behaviour::default(),
             stream: libp2p_stream::Behaviour::new(),

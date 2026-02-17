@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["mdns"]
+default = []
 mdns = ["libp2p/mdns"]
+autonat = ["libp2p/autonat"]
 
 [dependencies]
 anyhow.workspace = true

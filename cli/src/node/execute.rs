@@ -97,12 +97,15 @@ pub fn execute_commands(
                 peer,
                 service,
                 bind,
+                relayed,
             } => {
                 let control = ctx.stream_control.clone();
                 let peer = *peer;
                 let svc = service.clone();
                 let addr = bind.clone();
+                let relayed = *relayed;
                 let label = format!("{peer}:{svc}@{addr}");
+                tracing::info!(%peer, service = %svc, bind = %addr, relayed, "spawning tunnel");
                 let handle = tokio::spawn(async move {
                     match tunnel::connect_tunnel(control, peer, svc, addr).await {
                         Ok(()) => {}
@@ -110,6 +113,9 @@ pub fn execute_commands(
                     }
                 });
                 ctx.tunnel_registry.register(label, handle);
+            }
+            Command::AwaitHolePunch { .. } => {
+                // Handled by the event loop's holepunch deadline tracking, not the executor
             }
         }
     }

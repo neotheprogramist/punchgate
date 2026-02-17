@@ -76,20 +76,21 @@ impl TunnelState {
         specs: Vec<(ServiceName, ServiceAddr)>,
     ) -> Vec<Command> {
         if self.holepunch_failed.contains(&peer) {
-            for (service, _bind) in &specs {
-                tracing::error!(
-                    peer = %peer,
-                    service = %service,
-                    "tunnel request dropped: hole punch already failed, only relay connection available"
-                );
-            }
-            Vec::new()
+            specs
+                .into_iter()
+                .map(|(service, bind)| Command::SpawnTunnel {
+                    peer,
+                    service,
+                    bind,
+                    relayed: true,
+                })
+                .collect()
         } else if self.relayed_peers.contains(&peer) {
             self.awaiting_holepunch
                 .entry(peer)
                 .or_default()
                 .extend(specs);
-            Vec::new()
+            vec![Command::AwaitHolePunch { peer }]
         } else {
             specs
                 .into_iter()
@@ -97,6 +98,7 @@ impl TunnelState {
                     peer,
                     service,
                     bind,
+                    relayed: false,
                 })
                 .collect()
         }
@@ -173,6 +175,7 @@ impl MealyMachine for TunnelState {
                         self.relayed_peers.insert(peer);
                         if let Some(specs) = self.pending_by_peer.remove(&peer) {
                             self.awaiting_holepunch.insert(peer, specs);
+                            commands.push(Command::AwaitHolePunch { peer });
                         }
                     }
                     false => {
@@ -188,6 +191,7 @@ impl MealyMachine for TunnelState {
                                     peer,
                                     service,
                                     bind,
+                                    relayed: false,
                                 }),
                         );
                     }
@@ -206,6 +210,7 @@ impl MealyMachine for TunnelState {
                             peer: remote_peer,
                             service,
                             bind,
+                            relayed: false,
                         }),
                 );
             }
@@ -216,14 +221,36 @@ impl MealyMachine for TunnelState {
             } => {
                 self.holepunch_failed.insert(remote_peer);
                 if let Some(specs) = self.awaiting_holepunch.remove(&remote_peer) {
-                    for (service, _bind) in &specs {
-                        tracing::error!(
-                            peer = %remote_peer,
-                            service = %service,
-                            reason = %reason,
-                            "tunnel request dropped: hole punch failed, no direct connection"
-                        );
-                    }
+                    tracing::info!(
+                        peer = %remote_peer,
+                        reason = %reason,
+                        "hole punch failed, falling back to relay for tunnel"
+                    );
+                    commands.extend(specs.into_iter().map(|(service, bind)| {
+                        Command::SpawnTunnel {
+                            peer: remote_peer,
+                            service,
+                            bind,
+                            relayed: true,
+                        }
+                    }));
+                }
+            }
+
+            Event::HolePunchTimeout { peer } => {
+                if let Some(specs) = self.awaiting_holepunch.remove(&peer) {
+                    tracing::info!(
+                        peer = %peer,
+                        "hole punch timeout, falling back to relay for tunnel"
+                    );
+                    commands.extend(specs.into_iter().map(|(service, bind)| {
+                        Command::SpawnTunnel {
+                            peer,
+                            service,
+                            bind,
+                            relayed: true,
+                        }
+                    }));
                 }
             }
 
@@ -353,7 +380,7 @@ mod tests {
             });
 
             let has_spawn = commands.contains(&Command::SpawnTunnel {
-                peer, service, bind,
+                peer, service, bind, relayed: false,
             });
             prop_assert!(has_spawn);
             prop_assert!(!state.has_pending_for(&peer));
@@ -394,7 +421,7 @@ mod tests {
             });
 
             let has_spawn = commands.contains(&Command::SpawnTunnel {
-                peer: provider, service, bind,
+                peer: provider, service, bind, relayed: false,
             });
             prop_assert!(has_spawn);
         }
@@ -433,7 +460,7 @@ mod tests {
             });
 
             let has_spawn = commands.contains(&Command::SpawnTunnel {
-                peer, service, bind,
+                peer, service, bind, relayed: false,
             });
             prop_assert!(has_spawn);
         }
@@ -451,7 +478,8 @@ mod tests {
                 peer, relayed: true,
             });
 
-            prop_assert!(commands.is_empty());
+            let has_await = commands.contains(&Command::AwaitHolePunch { peer });
+            prop_assert!(has_await);
             prop_assert!(state.awaiting_holepunch.contains_key(&peer));
         }
 
@@ -469,27 +497,30 @@ mod tests {
             });
 
             let has_spawn = commands.contains(&Command::SpawnTunnel {
-                peer, service, bind,
+                peer, service, bind, relayed: false,
             });
             prop_assert!(has_spawn);
             prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
         }
 
         #[test]
-        fn hole_punch_failed_removes_pending(
+        fn hole_punch_failed_spawns_on_relay(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
             reason in "[a-z ]{1,20}",
         ) {
             let mut state = TunnelState::new();
-            state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+            state.awaiting_holepunch.insert(peer, vec![(service.clone(), bind.clone())]);
 
             let (state, commands) = state.transition(Event::HolePunchFailed {
                 remote_peer: peer, reason,
             });
 
-            prop_assert!(commands.is_empty());
+            let has_spawn = commands.contains(&Command::SpawnTunnel {
+                peer, service, bind, relayed: true,
+            });
+            prop_assert!(has_spawn);
             prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
         }
 
@@ -538,7 +569,8 @@ mod tests {
                 peer, connected: true,
             });
 
-            prop_assert!(commands.is_empty());
+            let has_await = commands.contains(&Command::AwaitHolePunch { peer });
+            prop_assert!(has_await);
             prop_assert!(!state.pending_by_peer.contains_key(&peer));
             prop_assert!(state.awaiting_holepunch.contains_key(&peer));
             let waiting = state.awaiting_holepunch
@@ -563,7 +595,8 @@ mod tests {
                 connected: true,
             });
 
-            prop_assert!(commands.is_empty());
+            let has_await = commands.contains(&Command::AwaitHolePunch { peer: provider });
+            prop_assert!(has_await);
             prop_assert!(state.awaiting_holepunch.contains_key(&provider));
             let waiting = state.awaiting_holepunch
                 .get(&provider)
@@ -572,42 +605,46 @@ mod tests {
         }
 
         #[test]
-        fn dht_peer_lookup_holepunch_failed_drops_specs(
+        fn dht_peer_lookup_holepunch_failed_spawns_on_relay(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
         ) {
             let mut state = TunnelState::new();
             state.holepunch_failed.insert(peer);
-            state.add_peer_tunnel(peer, service, bind);
+            state.add_peer_tunnel(peer, service.clone(), bind.clone());
 
             let (state, commands) = state.transition(Event::DhtPeerLookupComplete {
                 peer, connected: true,
             });
 
-            prop_assert!(commands.is_empty());
+            let has_spawn = commands.contains(&Command::SpawnTunnel {
+                peer, service, bind, relayed: true,
+            });
+            prop_assert!(has_spawn);
             prop_assert!(!state.pending_by_peer.contains_key(&peer));
-            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
         }
 
         #[test]
-        fn dht_service_resolved_holepunch_failed_drops_specs(
+        fn dht_service_resolved_holepunch_failed_spawns_on_relay(
             service in arb_service_name(),
             bind in arb_service_addr(),
             provider in arb_peer_id(),
         ) {
             let mut state = TunnelState::new();
             state.holepunch_failed.insert(provider);
-            state.add_service_tunnel(service.clone(), bind);
+            state.add_service_tunnel(service.clone(), bind.clone());
 
-            let (state, commands) = state.transition(Event::DhtServiceResolved {
-                service_name: service,
+            let (_state, commands) = state.transition(Event::DhtServiceResolved {
+                service_name: service.clone(),
                 provider,
                 connected: true,
             });
 
-            prop_assert!(commands.is_empty());
-            prop_assert!(!state.awaiting_holepunch.contains_key(&provider));
+            let has_spawn = commands.contains(&Command::SpawnTunnel {
+                peer: provider, service, bind, relayed: true,
+            });
+            prop_assert!(has_spawn);
         }
 
         #[test]
@@ -643,7 +680,7 @@ mod tests {
             });
 
             let has_spawn = commands.contains(&Command::SpawnTunnel {
-                peer, service, bind,
+                peer, service, bind, relayed: false,
             });
             prop_assert!(has_spawn);
             prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
@@ -697,7 +734,7 @@ mod tests {
             prop_assert!(!state.holepunch_failed.contains(&peer));
             prop_assert!(!state.relayed_peers.contains(&peer));
             let has_spawn = commands.contains(&Command::SpawnTunnel {
-                peer, service, bind,
+                peer, service, bind, relayed: false,
             });
             prop_assert!(has_spawn);
         }
@@ -722,13 +759,32 @@ mod tests {
 
             prop_assert_eq!(commands.len(), 2);
             let has_first = commands.contains(&Command::SpawnTunnel {
-                peer, service: s1, bind: b1,
+                peer, service: s1, bind: b1, relayed: false,
             });
             prop_assert!(has_first);
             let has_second = commands.contains(&Command::SpawnTunnel {
-                peer, service: s2, bind: b2,
+                peer, service: s2, bind: b2, relayed: false,
             });
             prop_assert!(has_second);
+            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+        }
+
+        #[test]
+        fn holepunch_timeout_spawns_on_relay(
+            peer in arb_peer_id(),
+            service in arb_service_name(),
+            bind in arb_service_addr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.relayed_peers.insert(peer);
+            state.awaiting_holepunch.insert(peer, vec![(service.clone(), bind.clone())]);
+
+            let (state, commands) = state.transition(Event::HolePunchTimeout { peer });
+
+            let has_spawn = commands.contains(&Command::SpawnTunnel {
+                peer, service, bind, relayed: true,
+            });
+            prop_assert!(has_spawn);
             prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
         }
     }

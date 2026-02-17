@@ -202,18 +202,48 @@ else
     fail "NAT translation not detected — expected connections from 10.100.0.12"
 fi
 
-# ── Step 8: Report DCUtR status (informational) ─────────────────────────
+# ── Step 8: Verify DCUtR hole punch ──────────────────────────────────
 
-CLEAN_LOGS=$($COMPOSE logs client workhorse 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+# Query each service separately — podman compose may not reliably combine
+# multi-service log output in a single invocation.
+WH_LOGS=$($COMPOSE logs workhorse 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+CL_LOGS=$($COMPOSE logs client 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+CLEAN_LOGS="${WH_LOGS}"$'\n'"${CL_LOGS}"
 HP_SUCCESS=$(echo "$CLEAN_LOGS" | grep -c "hole punch succeeded" || true)
 HP_FAILURE=$(echo "$CLEAN_LOGS" | grep -c "hole punch failed" || true)
 
 if [[ "$HP_SUCCESS" -gt 0 ]]; then
     pass "DCUtR hole punch succeeded ($HP_SUCCESS event(s))"
 elif [[ "$HP_FAILURE" -gt 0 ]]; then
-    warn "DCUtR hole punch failed ($HP_FAILURE event(s)) — expected with full-cone NAT simulation"
+    warn "DCUtR hole punch failed ($HP_FAILURE event(s))"
+    warn "── client log (last 50 lines) ──"
+    $COMPOSE logs --tail 50 client 2>&1 || true
+    warn "── workhorse log (last 50 lines) ──"
+    $COMPOSE logs --tail 50 workhorse 2>&1 || true
+    fail "DCUtR hole punch failed — expected success with full-cone NAT"
 else
-    log "no DCUtR events (full-cone NAT allows direct connection without hole-punching)"
+    warn "no DCUtR events detected"
+    warn "── client log (last 50 lines) ──"
+    $COMPOSE logs --tail 50 client 2>&1 || true
+    warn "── workhorse log (last 50 lines) ──"
+    $COMPOSE logs --tail 50 workhorse 2>&1 || true
+    fail "no DCUtR events — hole punching not exercised"
+fi
+
+# ── Step 9: Verify tunnel uses direct connection ─────────────────────
+
+TUNNEL_DIRECT=$(echo "$CLEAN_LOGS" | grep "spawning tunnel" | grep -c "relayed=false" || true)
+
+if [[ "$TUNNEL_DIRECT" -gt 0 ]]; then
+    pass "tunnel spawned on direct connection (relayed=false)"
+else
+    TUNNEL_RELAY=$(echo "$CLEAN_LOGS" | grep "spawning tunnel" | grep -c "relayed=true" || true)
+    if [[ "$TUNNEL_RELAY" -gt 0 ]]; then
+        warn "tunnel spawned on relay (relayed=true) — DCUtR may have completed after tunnel setup"
+    fi
+    warn "── client log (last 50 lines) ──"
+    $COMPOSE logs --tail 50 client 2>&1 || true
+    fail "tunnel not spawned on direct connection"
 fi
 
 log "done."

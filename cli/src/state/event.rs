@@ -75,6 +75,9 @@ pub enum Event {
         remote_peer: PeerId,
         reason: String,
     },
+    HolePunchTimeout {
+        peer: PeerId,
+    },
 
     // ─── Bridge (synthesized by AppState) ───────────────────────────────────
     PhaseChanged {

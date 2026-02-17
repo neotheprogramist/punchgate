@@ -14,11 +14,14 @@ A peer-to-peer NAT-traversing tunnel mesh built on [libp2p](https://libp2p.io/).
 ### Build
 
 ```bash
-# Default build (includes mDNS for LAN discovery)
+# Default build (DHT-only discovery)
 cargo build
 
-# Without mDNS (forces DHT-only discovery — used in container E2E tests)
-cargo build --no-default-features
+# With mDNS for LAN discovery
+cargo build --features mdns
+
+# With AutoNAT for dynamic NAT detection
+cargo build --features autonat
 ```
 
 ### Run the Tests
@@ -113,7 +116,7 @@ This test:
 
 ### NAT Traversal: Tunnel Through a Relay
 
-The full NAT traversal flow connects a client to a service behind NAT via a public relay node, then upgrades to a direct connection via DCUtR hole punching. This requires three nodes on separate networks (or Docker containers / network namespaces).
+The full NAT traversal flow connects a client to a service behind NAT via a public relay node, then upgrades to a direct connection via DCUtR hole punching. This requires three nodes on separate networks.
 
 **Node 1 — Bootstrap (public IP, acts as relay):**
 
@@ -121,6 +124,8 @@ The full NAT traversal flow connects a client to a service behind NAT via a publ
 cargo run -p cli -- \
   --listen /ip4/0.0.0.0/udp/4001/quic-v1
 ```
+
+Note the peer ID from the log output (e.g. `local_peer_id=12D3KooW...`). All other nodes need this to connect.
 
 **Node 2 — Workhorse (behind NAT, exposes SSH):**
 
@@ -130,15 +135,17 @@ cargo run -p cli -- \
   --expose ssh=127.0.0.1:22
 ```
 
-Relay reservation is automatic. The workhorse connects to the bootstrap node, immediately requests a relay circuit reservation, advertises the relay circuit address as an external address, and publishes services to the DHT. When AutoNAT later confirms the node is publicly reachable, the relay is released.
+Any peer with `--bootstrap` is automatically treated as behind NAT: it requests a relay circuit and publishes the `ssh` service to the DHT. If DCUtR hole-punching later succeeds, traffic flows directly between peers; otherwise it falls back to relayed transport.
 
-**Node 3 — Client (tunnel to workhorse's SSH):**
+**Node 3 — Client (tunnel to workhorse's SSH by name):**
 
 ```bash
 cargo run -p cli -- \
   --bootstrap /ip4/<BOOTSTRAP_IP>/udp/4001/quic-v1/p2p/<BOOTSTRAP_ID> \
-  --tunnel <WORKHORSE_ID>:ssh@127.0.0.1:2222
+  --tunnel-by-name ssh@127.0.0.1:2222
 ```
+
+The client discovers the `ssh` provider via the Kademlia DHT — no need to know the workhorse's peer ID.
 
 **Verify:**
 
@@ -148,34 +155,136 @@ ssh -p 2222 user@127.0.0.1
 
 The data path: `ssh → TCP:2222 → Client → [DCUtR direct or relay] → Workhorse → TCP:22 → sshd`.
 
+## Production Deployment
+
+### Build the Image
+
+```bash
+podman build -t punchgate:local .
+```
+
+The resulting image is Alpine-based and runs as a non-root `punchgate` user. The default build has no optional features — mDNS and AutoNAT are opt-in via `--build-arg FEATURES="--features mdns,autonat"` if needed.
+
+### Bootstrap Node (Public VPS)
+
+The bootstrap node needs a public IP with UDP port 4001 open. It acts as a Kademlia DHT entry point and relay for NATed peers.
+
+Create the env file:
+
+```bash
+# .env
+PUNCHGATE_LISTEN=/ip4/0.0.0.0/udp/4001/quic-v1
+RUST_LOG=cli=info
+```
+
+Start the container with the QUIC port published:
+
+```bash
+podman run --detach \
+  --env-file .env \
+  --name punchgate \
+  --publish 0.0.0.0:4001:4001/udp \
+  localhost/punchgate:local
+```
+
+Get the peer ID from the logs:
+
+```bash
+podman logs punchgate
+# look for: local_peer_id=12D3KooW...
+```
+
+All other nodes need this peer ID and the bootstrap's public IP to join the mesh.
+
+### Non-Bootstrap Peer (Behind NAT)
+
+Peers behind NAT do not publish any ports. They connect outbound to bootstrap and receive inbound traffic through relay circuits or DCUtR hole-punched connections.
+
+Create the env file:
+
+```bash
+# .env
+PUNCHGATE_LISTEN=/ip4/0.0.0.0/udp/4001/quic-v1
+PUNCHGATE_BOOTSTRAP=/ip4/<BOOTSTRAP_PUBLIC_IP>/udp/4001/quic-v1/p2p/<BOOTSTRAP_PEER_ID>
+RUST_LOG=cli=info
+
+# Workhorse: expose a local service to the mesh
+PUNCHGATE_EXPOSE=myapp=host.containers.internal:8080
+
+# Client: tunnel a remote service to a local port
+# (use one of these, not both)
+PUNCHGATE_TUNNEL_BY_NAME=myapp@0.0.0.0:2222
+```
+
+Start without port publishing:
+
+```bash
+podman run --detach \
+  --env-file .env \
+  --name punchgate \
+  localhost/punchgate:local
+```
+
+Check the logs:
+
+```bash
+podman logs punchgate
+```
+
+### NAT Traversal Behavior
+
+NAT status is derived from topology: any peer with `--bootstrap` is treated as private (behind NAT), while a peer with no bootstrap addresses is public (the bootstrap node itself). No runtime detection is needed.
+
+The connection upgrade path:
+
+1. **Relay** — NATed peers reserve a relay circuit through bootstrap on connect
+2. **DCUtR hole punch** — both peers attempt simultaneous QUIC connections to punch through their NATs
+3. **Direct** — if hole-punching succeeds, tunnels use the direct connection; otherwise relay is the fallback
+
+For dynamic NAT detection, enable the `autonat` feature at build time.
+
+### Environment Variables
+
+All CLI flags have corresponding environment variables:
+
+| Variable                   | Equivalent flag    | Description                            |
+| -------------------------- | ------------------ | -------------------------------------- |
+| `PUNCHGATE_IDENTITY`       | `--identity`       | Path to Ed25519 keypair file           |
+| `PUNCHGATE_LISTEN`         | `--listen`         | Multiaddr(s) to listen on              |
+| `PUNCHGATE_BOOTSTRAP`      | `--bootstrap`      | Bootstrap peer multiaddr(s)            |
+| `PUNCHGATE_EXPOSE`         | `--expose`         | Expose local service: `name=host:port` |
+| `PUNCHGATE_TUNNEL`         | `--tunnel`         | Tunnel by peer ID: `peer:svc@bind`     |
+| `PUNCHGATE_TUNNEL_BY_NAME` | `--tunnel-by-name` | Tunnel by DHT lookup: `svc@bind`       |
+| `RUST_LOG`                 | —                  | Log verbosity (default: `info`)        |
+
 ### Container E2E Test: NAT Traversal via Compose
 
-The full relay → DCUtR → tunnel flow can be tested locally using containers. The test script builds the image with `--no-default-features` (mDNS disabled), forcing all discovery through the Kademlia DHT — same as a real multi-network deployment.
-
-Requires `podman compose`.
+The full relay → DCUtR hole-punch → direct tunnel flow can be tested locally with simulated NAT gateways. Requires `podman compose`.
 
 ```bash
 ./scripts/e2e_compose_test.sh
 ```
 
-The script orchestrates four containers on a single bridge network (`172.28.0.0/24`):
+The topology uses three isolated networks with full-cone NAT gateways:
 
-| Container     | IP          | Role                                           |
-| ------------- | ----------- | ---------------------------------------------- |
-| **echo**      | 172.28.0.20 | TCP echo server (python:3-alpine)              |
-| **bootstrap** | 172.28.0.10 | Public relay node                              |
-| **workhorse** | 172.28.0.30 | NAT'd peer, exposes echo via relay             |
-| **client**    | 172.28.0.40 | Tunnels to workhorse's echo, port 2222 on host |
-
-To build the image separately:
-
-```bash
-# Production image (mDNS enabled — default)
-podman build -t punchgate:local .
-
-# E2E test image (no mDNS — forces DHT-only discovery)
-podman build -t punchgate:local --build-arg FEATURES=--no-default-features .
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    public (10.100.0.0/24)                       │
+│                                                                 │
+│   bootstrap          nat-a              nat-b                   │
+│   10.100.0.10        10.100.0.11        10.100.0.12             │
+└───────┬───────────────┬──────────────────┬──────────────────────┘
+        │               │                  │
+        │     ┌─────────┴─────────┐  ┌─────┴──────────────┐
+        │     │  lan-a (internal) │  │  lan-b (internal)   │
+        │     │  10.0.1.0/24      │  │  10.0.2.0/24        │
+        │     │                   │  │                     │
+        │     │  echo    workhrs  │  │  client  test-probe │
+        │     │  .20       .30    │  │  .40       .50      │
+        │     └───────────────────┘  └─────────────────────┘
+```
+
+The test verifies: relay reservation, DCUtR hole-punch success, direct tunnel establishment, and end-to-end echo payload roundtrip through both NATs.
 
 ## Observability
 
@@ -230,15 +339,16 @@ python scripts/log_phases.py        # → logs/phases.txt
 
 ## Configuration
 
-| Flag                      | Default                      | Description                             |
-| ------------------------- | ---------------------------- | --------------------------------------- |
-| `--identity PATH`         | `identity.key`               | Persistent Ed25519 keypair file         |
-| `--listen MULTIADDR`      | `/ip4/0.0.0.0/udp/0/quic-v1` | Address(es) to listen on                |
-| `--bootstrap MULTIADDR`   | _(none)_                     | Peer(s) to dial on startup              |
-| `--expose NAME=HOST:PORT` | _(none)_                     | Expose a local TCP service to the mesh  |
-| `--tunnel PEER:SVC@BIND`  | _(none)_                     | Tunnel a remote service to a local port |
+| Flag                        | Default                      | Description                                         |
+| --------------------------- | ---------------------------- | --------------------------------------------------- |
+| `--identity PATH`           | `identity.key`               | Persistent Ed25519 keypair file                     |
+| `--listen MULTIADDR`        | `/ip4/0.0.0.0/udp/0/quic-v1` | Address(es) to listen on                            |
+| `--bootstrap MULTIADDR`     | _(none)_                     | Peer(s) to dial on startup                          |
+| `--expose NAME=HOST:PORT`   | _(none)_                     | Expose a local TCP service to the mesh              |
+| `--tunnel PEER:SVC@BIND`    | _(none)_                     | Tunnel a remote service to a local port             |
+| `--tunnel-by-name SVC@BIND` | _(none)_                     | Tunnel by service name (discovers provider via DHT) |
 
-Environment: `PUNCHGATE_IDENTITY` overrides `--identity`. `RUST_LOG` controls log verbosity (default: `info`).
+All flags accept corresponding `PUNCHGATE_*` environment variables (see [Environment Variables](#environment-variables)). `RUST_LOG` controls log verbosity (default: `info`).
 
 ## License
 

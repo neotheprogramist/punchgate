@@ -38,5 +38,9 @@ pub enum Command {
         peer: PeerId,
         service: ServiceName,
         bind: ServiceAddr,
+        relayed: bool,
+    },
+    AwaitHolePunch {
+        peer: PeerId,
     },
 }
