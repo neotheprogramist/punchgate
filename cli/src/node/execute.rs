@@ -117,6 +117,17 @@ pub fn execute_commands(
             Command::AwaitHolePunch { .. } => {
                 // Handled by the event loop's holepunch deadline tracking, not the executor
             }
+            Command::RetryDirectDial { peer } => {
+                if swarm.is_connected(peer) {
+                    tracing::debug!(%peer, "skipping retry dial — already connected");
+                } else {
+                    tracing::info!(%peer, "retrying direct dial for hole-punch");
+                    match swarm.dial(*peer) {
+                        Ok(()) => {}
+                        Err(e) => tracing::debug!(%peer, error = %e, "retry dial failed"),
+                    }
+                }
+            }
         }
     }
 }

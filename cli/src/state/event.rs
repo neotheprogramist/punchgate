@@ -78,6 +78,9 @@ pub enum Event {
     HolePunchTimeout {
         peer: PeerId,
     },
+    HolePunchRetryTick {
+        peer: PeerId,
+    },
 
     // ─── Bridge (synthesized by AppState) ───────────────────────────────────
     PhaseChanged {

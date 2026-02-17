@@ -21,7 +21,10 @@ use self::{
 use crate::{
     behaviour::Behaviour,
     external_addr,
-    protocol::{self, DISCOVERY_TIMEOUT, HOLEPUNCH_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
+    protocol::{
+        self, DISCOVERY_TIMEOUT, HOLEPUNCH_RETRY_INTERVAL, HOLEPUNCH_TIMEOUT,
+        IDLE_CONNECTION_TIMEOUT,
+    },
     shutdown,
     specs::{ExposedService, ServiceAddr, TunnelByNameSpec, TunnelSpec},
     state::{AppState, Command, Event, NatStatus, PeerState, Phase, TunnelState},
@@ -146,6 +149,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut holepunch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+    let mut holepunch_retries: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
 
     let shutdown_signal = shutdown::shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -153,6 +157,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
         let next_holepunch = holepunch_deadlines.values().min().copied();
+        let next_holepunch_retry = holepunch_retries.values().min().copied();
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -235,6 +240,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         Event::HolePunchSucceeded { remote_peer } => {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
                             holepunch_deadlines.remove(remote_peer);
+                            holepunch_retries.remove(remote_peer);
                         }
                         Event::HolePunchFailed { remote_peer, reason } => {
                             tracing::warn!(peer = %remote_peer, %reason, "hole punch failed");
@@ -242,9 +248,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         }
                         Event::TunnelPeerConnected { peer, relayed: false } => {
                             holepunch_deadlines.remove(peer);
+                            holepunch_retries.remove(peer);
                         }
                         Event::ConnectionLost { peer, remaining_connections: 0 } => {
                             holepunch_deadlines.remove(peer);
+                            holepunch_retries.remove(peer);
                         }
                         _ => {}
                     }
@@ -343,6 +351,37 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     log_phase_transition(old_phase, new_state.phase(), commands.len());
                     app_state = new_state;
                     execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+
+                    holepunch_retries.entry(peer)
+                        .or_insert(tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
+                }
+            }
+            _ = async {
+                match next_holepunch_retry {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let now = tokio::time::Instant::now();
+                let due: Vec<PeerId> = holepunch_retries
+                    .iter()
+                    .filter(|(_, deadline)| **deadline <= now)
+                    .map(|(pid, _)| *pid)
+                    .collect();
+
+                for peer in due {
+                    holepunch_retries.remove(&peer);
+                    tracing::info!(%peer, "retrying hole-punch via direct dial");
+                    let old_phase = app_state.phase();
+                    let (new_state, commands) = app_state.transition(Event::HolePunchRetryTick { peer });
+                    tracing::debug!(event = "HolePunchRetryTick", commands = commands.len(), "event processed");
+                    log_phase_transition(old_phase, new_state.phase(), commands.len());
+                    app_state = new_state;
+                    execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+
+                    if commands.iter().any(|c| matches!(c, Command::RetryDirectDial { .. })) {
+                        holepunch_retries.insert(peer, tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
+                    }
                 }
             }
             _ = &mut shutdown_signal => {

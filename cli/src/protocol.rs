@@ -11,6 +11,8 @@ pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(3600);
 pub const SERVICE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 pub const HOLEPUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+pub const MAX_CIRCUIT_DURATION: Duration = Duration::from_secs(3600);
+pub const HOLEPUNCH_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn kad_protocol() -> StreamProtocol {
     // Infallible: KAD_PROTOCOL is a compile-time constant starting with '/' as required by StreamProtocol

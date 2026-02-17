@@ -35,7 +35,11 @@ impl Behaviour {
         #[cfg(feature = "mdns")]
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
-        let relay_server = relay::Behaviour::new(peer_id, Default::default());
+        let relay_config = relay::Config {
+            max_circuit_duration: protocol::MAX_CIRCUIT_DURATION,
+            ..Default::default()
+        };
+        let relay_server = relay::Behaviour::new(peer_id, relay_config);
 
         let identify = identify::Behaviour::new(identify::Config::new(
             protocol::IDENTIFY_PROTOCOL.to_string(),

@@ -43,4 +43,7 @@ pub enum Command {
     AwaitHolePunch {
         peer: PeerId,
     },
+    RetryDirectDial {
+        peer: PeerId,
+    },
 }

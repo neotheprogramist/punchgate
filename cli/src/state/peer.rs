@@ -195,10 +195,12 @@ impl MealyMachine for PeerState {
                 let entry = self.known_peers.entry(peer).or_default();
                 for addr in &listen_addrs {
                     entry.insert(addr.clone());
-                    commands.push(Command::KademliaAddAddress {
-                        peer,
-                        addr: addr.clone(),
-                    });
+                    if crate::external_addr::has_public_ip(addr) {
+                        commands.push(Command::KademliaAddAddress {
+                            peer,
+                            addr: addr.clone(),
+                        });
+                    }
                 }
                 if self.bootstrap_peers.contains(&peer) {
                     commands.extend(self.maybe_request_relay());
@@ -217,6 +219,7 @@ impl MealyMachine for PeerState {
             Event::HolePunchSucceeded { .. }
             | Event::HolePunchFailed { .. }
             | Event::HolePunchTimeout { .. }
+            | Event::HolePunchRetryTick { .. }
             | Event::DhtPeerLookupComplete { .. }
             | Event::DhtServiceResolved { .. }
             | Event::DhtServiceFailed { .. }
@@ -599,9 +602,9 @@ mod tests {
         }
 
         #[test]
-        fn peer_identified_adds_all_addresses(
+        fn peer_identified_adds_public_addresses_to_kademlia(
             peer in arb_peer_id(),
-            addrs in proptest::collection::vec(arb_multiaddr(), 1..5),
+            addrs in proptest::collection::vec(arb_public_multiaddr(), 1..5),
             observed in arb_multiaddr(),
         ) {
             let state = PeerState::new();
@@ -621,6 +624,37 @@ mod tests {
                 .filter(|c| matches!(c, Command::KademliaAddAddress { .. }))
                 .count();
             prop_assert_eq!(kad_add_count, addrs.len());
+        }
+
+        #[test]
+        fn peer_identified_filters_private_addrs_from_kademlia(
+            peer in arb_peer_id(),
+            public_addr in arb_public_multiaddr(),
+            private_addr in arb_private_multiaddr(),
+            observed in arb_multiaddr(),
+        ) {
+            let state = PeerState::new();
+            let (new_state, commands) = state.transition(Event::PeerIdentified {
+                peer,
+                listen_addrs: vec![public_addr.clone(), private_addr.clone()],
+                observed_addr: observed,
+            });
+
+            // Both addresses stored in known_peers
+            let stored = new_state.known_peers.get(&peer)
+                .expect("peer should be in known_peers after PeerIdentified");
+            prop_assert!(stored.contains(&public_addr));
+            prop_assert!(stored.contains(&private_addr));
+
+            // Only public address pushed to Kademlia
+            let kad_addrs: Vec<_> = commands.iter()
+                .filter_map(|c| match c {
+                    Command::KademliaAddAddress { addr, .. } => Some(addr),
+                    _ => None,
+                })
+                .collect();
+            prop_assert_eq!(kad_addrs.len(), 1);
+            prop_assert_eq!(kad_addrs[0], &public_addr);
         }
 
         #[test]

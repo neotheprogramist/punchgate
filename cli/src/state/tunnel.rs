@@ -238,6 +238,7 @@ impl MealyMachine for TunnelState {
             }
 
             Event::HolePunchTimeout { peer } => {
+                self.holepunch_failed.insert(peer);
                 if let Some(specs) = self.awaiting_holepunch.remove(&peer) {
                     tracing::info!(
                         peer = %peer,
@@ -268,6 +269,12 @@ impl MealyMachine for TunnelState {
                             "tunnel request dropped: all connections to peer lost"
                         );
                     }
+                }
+            }
+
+            Event::HolePunchRetryTick { peer } => {
+                if self.relayed_peers.contains(&peer) {
+                    commands.push(Command::RetryDirectDial { peer });
                 }
             }
 
@@ -786,6 +793,47 @@ mod tests {
             });
             prop_assert!(has_spawn);
             prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+            prop_assert!(state.holepunch_failed.contains(&peer));
+        }
+
+        #[test]
+        fn holepunch_retry_dials_relayed_peer(
+            peer in arb_peer_id(),
+        ) {
+            let mut state = TunnelState::new();
+            state.relayed_peers.insert(peer);
+
+            let (_, commands) = state.transition(Event::HolePunchRetryTick { peer });
+
+            let has_dial = commands.contains(&Command::RetryDirectDial { peer });
+            prop_assert!(has_dial);
+        }
+
+        #[test]
+        fn holepunch_retry_noop_for_non_relayed_peer(
+            peer in arb_peer_id(),
+        ) {
+            let state = TunnelState::new();
+
+            let (_, commands) = state.transition(Event::HolePunchRetryTick { peer });
+
+            prop_assert!(commands.is_empty());
+        }
+
+        #[test]
+        fn direct_connection_clears_relayed_after_retry(
+            peer in arb_peer_id(),
+        ) {
+            let mut state = TunnelState::new();
+            state.relayed_peers.insert(peer);
+            state.holepunch_failed.insert(peer);
+
+            let (state, _) = state.transition(Event::TunnelPeerConnected {
+                peer, relayed: false,
+            });
+
+            prop_assert!(!state.relayed_peers.contains(&peer));
+            prop_assert!(!state.holepunch_failed.contains(&peer));
         }
     }
 }
