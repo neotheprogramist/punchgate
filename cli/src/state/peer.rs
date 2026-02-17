@@ -15,10 +15,11 @@ fn is_loopback_addr(addr: &Multiaddr) -> bool {
     })
 }
 
-fn prefer_non_loopback(addrs: &HashSet<Multiaddr>) -> Option<&Multiaddr> {
+fn prefer_public_addr(addrs: &HashSet<Multiaddr>) -> Option<&Multiaddr> {
     addrs
         .iter()
-        .find(|a| !is_loopback_addr(a))
+        .find(|a| crate::external_addr::has_public_ip(a))
+        .or_else(|| addrs.iter().find(|a| !is_loopback_addr(a)))
         .or_else(|| addrs.iter().next())
 }
 
@@ -76,7 +77,7 @@ impl PeerState {
                 .iter()
                 .find(|(p, _)| self.bootstrap_peers.contains(p))
                 .and_then(|(&peer, addrs)| {
-                    prefer_non_loopback(addrs).map(|addr| Command::RequestRelayReservation {
+                    prefer_public_addr(addrs).map(|addr| Command::RequestRelayReservation {
                         relay_peer: peer,
                         relay_addr: addr.clone(),
                     })
@@ -284,7 +285,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{
         arb_multiaddr, arb_nat_status, arb_nonloopback_multiaddr, arb_peer_id, arb_phase,
-        arb_relay_circuit_multiaddr,
+        arb_private_multiaddr, arb_public_multiaddr, arb_relay_circuit_multiaddr,
     };
 
     proptest! {
@@ -793,13 +794,13 @@ mod tests {
         }
 
         #[test]
-        fn relay_addr_prefers_non_loopback(
+        fn relay_addr_prefers_public_over_loopback(
             peer in arb_peer_id(),
-            external_addr in arb_nonloopback_multiaddr(),
+            public_addr in arb_public_multiaddr(),
             port in 1024u16..65535u16,
         ) {
             // Infallible: formatted loopback multiaddr is always valid
-            let loopback_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}")
+            let loopback_addr: Multiaddr = format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
                 .parse()
                 .expect("loopback multiaddr is always valid");
 
@@ -808,9 +809,8 @@ mod tests {
             state.bootstrap_peers.insert(peer);
             let addrs = state.known_peers.entry(peer).or_default();
             addrs.insert(loopback_addr);
-            addrs.insert(external_addr.clone());
+            addrs.insert(public_addr.clone());
 
-            // NatStatusChanged(Private) triggers relay request
             let (_, commands) = state.transition(Event::NatStatusChanged(NatStatus::Private));
 
             let relay_addr = commands.iter().find_map(|c| match c {
@@ -818,7 +818,37 @@ mod tests {
                 _ => None,
             });
             if let Some(addr) = relay_addr {
-                prop_assert!(!is_loopback_addr(addr));
+                prop_assert!(
+                    crate::external_addr::has_public_ip(addr),
+                    "relay should use public addr, got {addr}"
+                );
+            }
+        }
+
+        #[test]
+        fn relay_addr_prefers_public_over_private(
+            peer in arb_peer_id(),
+            public_addr in arb_public_multiaddr(),
+            private_addr in arb_private_multiaddr(),
+        ) {
+            let mut state = PeerState::new();
+            state.phase = Phase::Joining;
+            state.bootstrap_peers.insert(peer);
+            let addrs = state.known_peers.entry(peer).or_default();
+            addrs.insert(private_addr);
+            addrs.insert(public_addr.clone());
+
+            let (_, commands) = state.transition(Event::NatStatusChanged(NatStatus::Private));
+
+            let relay_addr = commands.iter().find_map(|c| match c {
+                Command::RequestRelayReservation { relay_addr, .. } => Some(relay_addr),
+                _ => None,
+            });
+            if let Some(addr) = relay_addr {
+                prop_assert!(
+                    crate::external_addr::has_public_ip(addr),
+                    "relay should prefer public over private, got {addr}"
+                );
             }
         }
 

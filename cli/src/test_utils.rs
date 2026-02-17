@@ -63,6 +63,40 @@ pub fn arb_nonloopback_multiaddr() -> impl Strategy<Value = Multiaddr> {
         })
 }
 
+pub fn arb_public_multiaddr() -> impl Strategy<Value = Multiaddr> {
+    (
+        1u8..=223,
+        any::<u8>(),
+        any::<u8>(),
+        1u8..=254,
+        1024u16..65535u16,
+    )
+        .prop_filter("must be public IP", |&(a, b, ..)| {
+            let ip = std::net::Ipv4Addr::new(a, b, 0, 0);
+            !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified()
+        })
+        .prop_map(|(a, b, c, d, port)| {
+            format!("/ip4/{a}.{b}.{c}.{d}/udp/{port}/quic-v1")
+                .parse()
+                .expect("generated public IP4/UDP/QUIC multiaddr is always valid")
+        })
+}
+
+pub fn arb_private_multiaddr() -> impl Strategy<Value = Multiaddr> {
+    prop_oneof![
+        (any::<u8>(), any::<u8>(), any::<u8>(), 1024u16..65535u16)
+            .prop_map(|(b, c, d, port)| format!("/ip4/10.{b}.{c}.{d}/udp/{port}/quic-v1")),
+        (16u8..=31, any::<u8>(), any::<u8>(), 1024u16..65535u16)
+            .prop_map(|(b, c, d, port)| format!("/ip4/172.{b}.{c}.{d}/udp/{port}/quic-v1")),
+        (any::<u8>(), any::<u8>(), 1024u16..65535u16)
+            .prop_map(|(c, d, port)| format!("/ip4/192.168.{c}.{d}/udp/{port}/quic-v1")),
+    ]
+    .prop_map(|s| {
+        s.parse()
+            .expect("generated private IP4/UDP/QUIC multiaddr is always valid")
+    })
+}
+
 pub fn arb_relay_circuit_multiaddr() -> impl Strategy<Value = Multiaddr> {
     (arb_nonloopback_multiaddr(), arb_peer_id()).prop_map(|(base, relay_peer)| {
         let mut addr = base;

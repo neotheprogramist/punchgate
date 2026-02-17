@@ -10,7 +10,7 @@ fn is_circuit_addr(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
 }
 
-fn has_public_ip(addr: &Multiaddr) -> bool {
+pub fn has_public_ip(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| match p {
         Protocol::Ip4(ip) => !needs_external_rewrite(ip),
         Protocol::Ip6(ip) => !ip.is_loopback() && !ip.is_unspecified(),

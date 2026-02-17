@@ -84,7 +84,12 @@ pub fn translate_swarm_event(
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-            tracing::warn!(peer = ?peer_id, error = %error, "outgoing connection error");
+            let err_msg = error.to_string();
+            if err_msg.contains("local peer id") {
+                tracing::debug!(peer = ?peer_id, "self-dial attempt (expected with few DHT peers)");
+            } else {
+                tracing::warn!(peer = ?peer_id, error = %error, "outgoing connection error");
+            }
         }
 
         SwarmEvent::ExternalAddrConfirmed { address } => {

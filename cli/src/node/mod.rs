@@ -236,9 +236,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
                             holepunch_deadlines.remove(remote_peer);
                         }
-                        Event::HolePunchFailed { remote_peer, .. } => {
-                            let ext_addrs: Vec<_> = swarm.external_addresses().collect();
-                            tracing::warn!(peer = %remote_peer, external_addrs = ?ext_addrs, "hole punch failed");
+                        Event::HolePunchFailed { remote_peer, reason } => {
+                            tracing::warn!(peer = %remote_peer, %reason, "hole punch failed");
                             holepunch_deadlines.remove(remote_peer);
                         }
                         Event::TunnelPeerConnected { peer, relayed: false } => {
