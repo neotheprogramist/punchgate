@@ -22,6 +22,24 @@ pub fn is_valid_external_candidate(addr: &Multiaddr) -> bool {
     !is_circuit_addr(addr) && has_public_ip(addr)
 }
 
+pub fn extract_public_ip_port(addr: &Multiaddr) -> Option<(std::net::IpAddr, u16)> {
+    let mut ip = None;
+    let mut port = None;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(a) if !needs_external_rewrite(a) => {
+                ip = Some(std::net::IpAddr::V4(a));
+            }
+            Protocol::Ip6(a) if !a.is_loopback() && !a.is_unspecified() => {
+                ip = Some(std::net::IpAddr::V6(a));
+            }
+            Protocol::Udp(p) | Protocol::Tcp(p) => port = Some(p),
+            _ => {}
+        }
+    }
+    ip.zip(port)
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;

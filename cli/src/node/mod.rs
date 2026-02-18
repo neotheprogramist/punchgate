@@ -4,6 +4,7 @@ mod translate;
 
 use std::{
     collections::{HashMap, HashSet},
+    net::IpAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -150,6 +151,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut holepunch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut holepunch_retries: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+    let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
 
     let shutdown_signal = shutdown::shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -233,6 +235,29 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         swarm.add_external_address(observed_addr.clone());
                     }
 
+                    // NAT type detection: track external port observations per IP
+                    if let Event::PeerIdentified { peer, observed_addr, .. } = &state_event
+                        && let Some((ip, port)) = external_addr::extract_public_ip_port(observed_addr)
+                    {
+                        let ports = observed_nat_ports.entry(ip).or_default();
+                        if ports.insert(port) {
+                            match ports.len() {
+                                1 => tracing::info!(
+                                    observer = %peer,
+                                    observed_ip = %ip,
+                                    observed_port = port,
+                                    "NAT mapping observed"
+                                ),
+                                _ => tracing::warn!(
+                                    observer = %peer,
+                                    observed_ip = %ip,
+                                    observed_ports = ?ports,
+                                    "symmetric NAT likely — multiple external ports for same IP, hole-punching will fail"
+                                ),
+                            }
+                        }
+                    }
+
                     match &state_event {
                         Event::RelayReservationAccepted { relay_peer } => {
                             tracing::info!(%relay_peer, "relay reservation accepted");
@@ -243,7 +268,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             holepunch_retries.remove(remote_peer);
                         }
                         Event::HolePunchFailed { remote_peer, reason } => {
-                            tracing::warn!(peer = %remote_peer, %reason, "hole punch failed");
+                            tracing::warn!(
+                                peer = %remote_peer,
+                                %reason,
+                                nat = %nat_type_summary(&observed_nat_ports),
+                                "hole punch failed"
+                            );
                             holepunch_deadlines.remove(remote_peer);
                         }
                         Event::TunnelPeerConnected { peer, relayed: false } => {
@@ -344,7 +374,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
                 for peer in due {
                     holepunch_deadlines.remove(&peer);
-                    tracing::info!(%peer, "hole punch timeout, falling back to relay");
+                    tracing::info!(
+                        %peer,
+                        nat = %nat_type_summary(&observed_nat_ports),
+                        "hole punch timeout, falling back to relay"
+                    );
                     let old_phase = app_state.phase();
                     let (new_state, commands) = app_state.transition(Event::HolePunchTimeout { peer });
                     tracing::debug!(event = "HolePunchTimeout", commands = commands.len(), "event processed");
@@ -429,5 +463,14 @@ fn log_phase_transition(old: Phase, new: Phase, commands: usize) {
                 "phase transition"
             );
         }
+    }
+}
+
+fn nat_type_summary(observations: &HashMap<IpAddr, HashSet<u16>>) -> &'static str {
+    let max_ports_per_ip = observations.values().map(|p| p.len()).max().unwrap_or(0);
+    match max_ports_per_ip {
+        0 => "no observations",
+        1 => "undetermined (single observer per IP)",
+        _ => "symmetric NAT likely (multiple ports per IP)",
     }
 }

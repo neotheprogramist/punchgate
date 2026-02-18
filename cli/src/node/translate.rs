@@ -87,8 +87,13 @@ pub fn translate_swarm_event(
             let err_msg = error.to_string();
             if err_msg.contains("local peer id") {
                 tracing::debug!(peer = ?peer_id, "self-dial attempt (expected with few DHT peers)");
+            } else if peer_id
+                .as_ref()
+                .is_some_and(|p| bootstrap_peers.contains(p))
+            {
+                tracing::warn!(peer = ?peer_id, error = %error, "bootstrap connection error");
             } else {
-                tracing::warn!(peer = ?peer_id, error = %error, "outgoing connection error");
+                tracing::debug!(peer = ?peer_id, error = %error, "outgoing connection error");
             }
         }
 
