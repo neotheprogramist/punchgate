@@ -33,6 +33,28 @@ impl NatMapping {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display)]
+pub enum NatFiltering {
+    #[strum(serialize = "Endpoint-Independent")]
+    EndpointIndependent,
+    #[strum(serialize = "Restricted")]
+    Restricted,
+    #[strum(serialize = "Unknown")]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NatClassification {
+    pub mapping: NatMapping,
+    pub filtering: NatFiltering,
+}
+
+impl NatClassification {
+    pub fn is_holepunch_viable(self) -> bool {
+        self.mapping.is_holepunch_viable()
+    }
+}
+
 pub async fn detect_nat_mapping(stun_servers: &[&str]) -> NatMapping {
     match probe_stun_servers(stun_servers).await {
         Ok(addrs) if addrs.len() >= 2 => classify_mapping(&addrs),
@@ -43,6 +65,76 @@ pub async fn detect_nat_mapping(stun_servers: &[&str]) -> NatMapping {
         Err(e) => {
             warn!("STUN probe failed: {e:#}");
             NatMapping::Unknown
+        }
+    }
+}
+
+pub async fn probe_filtering(
+    mut control: libp2p_stream::Control,
+    bootstrap_peer: libp2p::PeerId,
+    stun_server: &str,
+) -> NatFiltering {
+    match probe_filtering_inner(&mut control, bootstrap_peer, stun_server).await {
+        Ok(filtering) => filtering,
+        Err(e) => {
+            warn!("NAT filtering probe failed: {e:#}");
+            NatFiltering::Unknown
+        }
+    }
+}
+
+async fn probe_filtering_inner(
+    control: &mut libp2p_stream::Control,
+    bootstrap_peer: libp2p::PeerId,
+    stun_server: &str,
+) -> Result<NatFiltering> {
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("failed to bind probe UDP socket")?;
+
+    let mapped_addr = stun_binding_request(&socket, stun_server).await?;
+    tracing::info!(%mapped_addr, "filtering probe: learned mapped address via STUN");
+
+    let mut stream = control
+        .open_stream(bootstrap_peer, crate::protocol::nat_probe_protocol())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to open NAT probe stream to bootstrap")?;
+
+    let request = crate::nat_probe_protocol::NatProbeRequest { mapped_addr };
+    let data = serde_json::to_vec(&request)?;
+    let len = u32::try_from(data.len()).context("probe request too large")?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&data).await?;
+    stream.flush().await?;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    // Infallible: u32 always fits in usize on all Rust std-supported platforms (>= 32-bit)
+    let resp_len = usize::try_from(u32::from_be_bytes(len_buf))
+        .expect("u32 fits in usize on all supported platforms");
+    anyhow::ensure!(resp_len <= 1024, "probe response too large: {resp_len}");
+    let mut resp_buf = vec![0u8; resp_len];
+    stream.read_exact(&mut resp_buf).await?;
+
+    let response: crate::nat_probe_protocol::NatProbeResponse = serde_json::from_slice(&resp_buf)?;
+    anyhow::ensure!(response.probe_sent, "bootstrap refused to send probe");
+
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(STUN_TIMEOUT, socket.recv_from(&mut buf)).await {
+        Ok(Ok((_, src))) => {
+            tracing::info!(%src, "filtering probe: received UDP probe — full cone NAT");
+            Ok(NatFiltering::EndpointIndependent)
+        }
+        Ok(Err(e)) => {
+            tracing::info!(error = %e, "filtering probe: recv error");
+            Ok(NatFiltering::Unknown)
+        }
+        Err(_) => {
+            tracing::info!("filtering probe: no probe received — restricted filtering NAT");
+            Ok(NatFiltering::Restricted)
         }
     }
 }
@@ -226,5 +318,57 @@ mod tests {
                 .collect();
             prop_assert_eq!(classify_mapping(&addrs), NatMapping::EndpointIndependent);
         }
+
+        #[test]
+        fn classification_holepunch_viable_requires_ei_mapping(
+            filtering in prop_oneof![
+                Just(NatFiltering::EndpointIndependent),
+                Just(NatFiltering::Restricted),
+                Just(NatFiltering::Unknown),
+            ],
+        ) {
+            let class = NatClassification {
+                mapping: NatMapping::AddressDependent,
+                filtering,
+            };
+            prop_assert!(!class.is_holepunch_viable());
+        }
+
+        #[test]
+        fn classification_full_cone_always_viable(
+            mapping in prop_oneof![
+                Just(NatMapping::EndpointIndependent),
+                Just(NatMapping::Unknown),
+            ],
+        ) {
+            let class = NatClassification {
+                mapping,
+                filtering: NatFiltering::EndpointIndependent,
+            };
+            prop_assert!(class.is_holepunch_viable());
+        }
+    }
+
+    #[test]
+    fn endpoint_independent_filtering_display() {
+        assert_eq!(
+            NatFiltering::EndpointIndependent.to_string(),
+            "Endpoint-Independent"
+        );
+    }
+
+    #[test]
+    fn restricted_filtering_display() {
+        assert_eq!(NatFiltering::Restricted.to_string(), "Restricted");
+    }
+
+    #[test]
+    fn classification_combines_mapping_and_filtering() {
+        let class = NatClassification {
+            mapping: NatMapping::EndpointIndependent,
+            filtering: NatFiltering::Restricted,
+        };
+        assert_eq!(class.mapping, NatMapping::EndpointIndependent);
+        assert_eq!(class.filtering, NatFiltering::Restricted);
     }
 }

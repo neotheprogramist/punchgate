@@ -114,8 +114,13 @@ pub fn execute_commands(
                 });
                 ctx.tunnel_registry.register(label, handle);
             }
-            Command::AwaitHolePunch { .. } => {
-                // Handled by the event loop's holepunch deadline tracking, not the executor
+            Command::AwaitHolePunch { peer } => {
+                let external_addrs: Vec<_> = swarm.external_addresses().collect();
+                tracing::info!(
+                    %peer,
+                    addrs = ?external_addrs,
+                    "awaiting hole-punch — external address snapshot"
+                );
             }
             Command::RetryDirectDial { peer } => {
                 if swarm.is_connected(peer) {

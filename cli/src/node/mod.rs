@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder, noise, swarm::SwarmEvent, yamux};
 
@@ -114,6 +114,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("tunnel protocol already registered"))?;
     tokio::spawn(crate::tunnel::accept_loop(incoming, services.clone()));
 
+    if config.bootstrap_addrs.is_empty() {
+        let mut probe_control = swarm.behaviour().stream.new_control();
+        let probe_incoming = probe_control
+            .accept(protocol::nat_probe_protocol())
+            .map_err(|_| anyhow::anyhow!("NAT probe protocol already registered"))?;
+        tokio::spawn(nat_probe_accept_loop(probe_incoming));
+    }
+
     // Populate TunnelState with requested tunnel specs (replaces imperative HashMaps)
     let mut tunnel_state = TunnelState::new();
     for spec in &config.tunnel_specs {
@@ -126,6 +134,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     for spec in &config.tunnel_by_name_specs {
         tunnel_state.add_service_tunnel(spec.service_name.clone(), spec.bind_addr.clone());
     }
+
+    let filtering_probe_control = swarm.behaviour().stream.new_control();
 
     let mut ctx = ExecutionContext {
         active_bootstrap_query: None,
@@ -253,6 +263,25 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                 }
 
+                if let SwarmEvent::Dialing { peer_id: Some(peer_id), .. } = &event
+                    && holepunch_deadlines.contains_key(peer_id)
+                {
+                    tracing::info!(
+                        peer = %peer_id,
+                        "hole-punch dial attempt in progress"
+                    );
+                }
+
+                if let SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } = &event
+                    && holepunch_deadlines.contains_key(peer_id)
+                {
+                    tracing::info!(
+                        peer = %peer_id,
+                        error = %error,
+                        "hole-punch dial attempt failed"
+                    );
+                }
+
                 if let SwarmEvent::NewExternalAddrCandidate { address } = &event {
                     if external_addr::is_valid_external_candidate(address) {
                         tracing::info!(%address, "new external address candidate (confirming)");
@@ -309,6 +338,24 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     match &state_event {
                         Event::RelayReservationAccepted { relay_peer } => {
                             tracing::info!(%relay_peer, "relay reservation accepted");
+                            if nat_mapping == crate::nat_probe::NatMapping::EndpointIndependent
+                                && let Some(&stun_server) = crate::nat_probe::DEFAULT_STUN_SERVERS.first()
+                            {
+                                let probe_ctl = filtering_probe_control.clone();
+                                let bootstrap = *relay_peer;
+                                tokio::spawn(async move {
+                                    let filtering = crate::nat_probe::probe_filtering(
+                                        probe_ctl,
+                                        bootstrap,
+                                        stun_server,
+                                    ).await;
+                                    tracing::info!(
+                                        %filtering,
+                                        %bootstrap,
+                                        "NAT filtering probe result"
+                                    );
+                                });
+                            }
                         }
                         Event::HolePunchSucceeded { remote_peer } => {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
@@ -346,6 +393,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         if let Command::AwaitHolePunch { peer } = cmd {
                             holepunch_deadlines.entry(*peer)
                                 .or_insert(tokio::time::Instant::now() + HOLEPUNCH_TIMEOUT);
+                            tracing::info!(
+                                %peer,
+                                timeout_secs = HOLEPUNCH_TIMEOUT.as_secs(),
+                                "hole-punch timer started"
+                            );
                         }
                     }
 
@@ -487,6 +539,62 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     ctx.tunnel_registry
         .shutdown_all(Duration::from_secs(5))
         .await;
+
+    Ok(())
+}
+
+// ─── NAT probe handler (bootstrap only) ─────────────────────────────────────
+
+async fn nat_probe_accept_loop(mut incoming: libp2p_stream::IncomingStreams) {
+    while let Some((peer_id, mut stream)) = incoming.next().await {
+        tokio::spawn(async move {
+            match handle_nat_probe(peer_id, &mut stream).await {
+                Ok(()) => {}
+                Err(e) => tracing::warn!(%peer_id, error = %e, "NAT probe handler failed"),
+            }
+        });
+    }
+}
+
+async fn handle_nat_probe(
+    peer_id: libp2p::PeerId,
+    stream: &mut libp2p::Stream,
+) -> anyhow::Result<()> {
+    use futures::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    // Infallible: u32 always fits in usize on all Rust std-supported platforms (>= 32-bit)
+    let len = usize::try_from(u32::from_be_bytes(len_buf))
+        .expect("u32 fits in usize on all supported platforms");
+    const MAX_MESSAGE_SIZE: usize = 65536;
+    anyhow::ensure!(
+        len <= MAX_MESSAGE_SIZE,
+        "NAT probe request too large: {len} bytes"
+    );
+
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    let request: crate::nat_probe_protocol::NatProbeRequest = serde_json::from_slice(&buf)?;
+
+    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+    socket
+        .send_to(b"punchgate-nat-probe", request.mapped_addr)
+        .await?;
+
+    tracing::info!(
+        %peer_id,
+        mapped_addr = %request.mapped_addr,
+        "sent NAT filtering probe"
+    );
+
+    let response = crate::nat_probe_protocol::NatProbeResponse { probe_sent: true };
+    let data = serde_json::to_vec(&response)?;
+    let response_len =
+        u32::try_from(data.len()).context("NAT probe response too large for u32 length prefix")?;
+    stream.write_all(&response_len.to_be_bytes()).await?;
+    stream.write_all(&data).await?;
+    stream.flush().await?;
 
     Ok(())
 }
