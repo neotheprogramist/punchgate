@@ -15,6 +15,25 @@ pub struct PortMapping {
     pub protocol_used: &'static str,
 }
 
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_unspecified()
+                && !is_shared_address(v4)
+        }
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+    }
+}
+
+fn is_shared_address(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    // 100.64.0.0/10 — CGNAT (RFC 6598)
+    octets[0] == 100 && (octets[1] & 0xC0) == 64
+}
+
 fn detect_gateway() -> Result<Ipv4Addr> {
     let gw = default_net::get_default_gateway()
         .map_err(|e| anyhow::anyhow!(e))
@@ -47,6 +66,10 @@ async fn try_upnp(internal_port: u16, local_ip: Ipv4Addr) -> Result<PortMapping>
         .get_external_ip()
         .await
         .map_err(|e| anyhow::anyhow!("UPnP get external IP failed: {e}"))?;
+
+    if !is_publicly_routable(ext_ip) {
+        anyhow::bail!("UPnP returned non-routable address {ext_ip} (likely CGNAT/double NAT)");
+    }
 
     gw.add_port(
         igd_next::PortMappingProtocol::UDP,
@@ -94,6 +117,12 @@ async fn try_nat_pmp_pcp(
             (IpAddr::V4(ext_ipv4), "NAT-PMP")
         }
     };
+
+    if !is_publicly_routable(external_ip) {
+        anyhow::bail!(
+            "NAT-PMP/PCP returned non-routable address {external_ip} (likely CGNAT/double NAT)"
+        );
+    }
 
     Ok(PortMapping {
         external_addr: SocketAddr::new(external_ip, external_port),
