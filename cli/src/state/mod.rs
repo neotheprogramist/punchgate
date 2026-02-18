@@ -9,3 +9,5 @@ pub use command::Command;
 pub use event::Event;
 pub use peer::{NatStatus, PeerState, Phase};
 pub use tunnel::TunnelState;
+
+pub use crate::nat_probe::NatMapping;

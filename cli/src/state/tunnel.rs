@@ -4,6 +4,7 @@ use libp2p::PeerId;
 
 use super::{command::Command, event::Event, peer::Phase};
 use crate::{
+    nat_probe::NatMapping,
     specs::ServiceAddr,
     traits::MealyMachine,
     types::{KademliaKey, ServiceName},
@@ -17,6 +18,7 @@ pub struct TunnelState {
     awaiting_holepunch: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
     relayed_peers: HashSet<PeerId>,
     holepunch_failed: HashSet<PeerId>,
+    nat_mapping: NatMapping,
 }
 
 impl Default for TunnelState {
@@ -34,7 +36,12 @@ impl TunnelState {
             awaiting_holepunch: HashMap::new(),
             relayed_peers: HashSet::new(),
             holepunch_failed: HashSet::new(),
+            nat_mapping: NatMapping::Unknown,
         }
+    }
+
+    pub fn set_nat_mapping(&mut self, mapping: NatMapping) {
+        self.nat_mapping = mapping;
     }
 
     pub fn add_peer_tunnel(&mut self, peer: PeerId, service: ServiceName, bind: ServiceAddr) {
@@ -75,7 +82,7 @@ impl TunnelState {
         peer: PeerId,
         specs: Vec<(ServiceName, ServiceAddr)>,
     ) -> Vec<Command> {
-        if self.holepunch_failed.contains(&peer) {
+        if self.holepunch_failed.contains(&peer) || !self.nat_mapping.is_holepunch_viable() {
             specs
                 .into_iter()
                 .map(|(service, bind)| Command::SpawnTunnel {
@@ -174,8 +181,19 @@ impl MealyMachine for TunnelState {
                     true => {
                         self.relayed_peers.insert(peer);
                         if let Some(specs) = self.pending_by_peer.remove(&peer) {
-                            self.awaiting_holepunch.insert(peer, specs);
-                            commands.push(Command::AwaitHolePunch { peer });
+                            if self.nat_mapping.is_holepunch_viable() {
+                                self.awaiting_holepunch.insert(peer, specs);
+                                commands.push(Command::AwaitHolePunch { peer });
+                            } else {
+                                commands.extend(specs.into_iter().map(|(service, bind)| {
+                                    Command::SpawnTunnel {
+                                        peer,
+                                        service,
+                                        bind,
+                                        relayed: true,
+                                    }
+                                }));
+                            }
                         }
                     }
                     false => {
@@ -276,6 +294,10 @@ impl MealyMachine for TunnelState {
                 if self.relayed_peers.contains(&peer) {
                     commands.push(Command::RetryDirectDial { peer });
                 }
+            }
+
+            Event::NatMappingDetected(mapping) => {
+                self.nat_mapping = mapping;
             }
 
             Event::PhaseChanged { .. }
@@ -834,6 +856,84 @@ mod tests {
 
             prop_assert!(!state.relayed_peers.contains(&peer));
             prop_assert!(!state.holepunch_failed.contains(&peer));
+        }
+
+        // ─── Symmetric NAT skip tests ──────────────────────────────────
+
+        #[test]
+        fn relayed_peer_skips_holepunch_when_symmetric_nat(
+            peer in arb_peer_id(),
+            service in arb_service_name(),
+            bind in arb_service_addr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::AddressDependent);
+            state.relayed_peers.insert(peer);
+            state.add_peer_tunnel(peer, service.clone(), bind.clone());
+
+            let (state, commands) = state.transition(Event::DhtPeerLookupComplete {
+                peer, connected: true,
+            });
+
+            let has_spawn = commands.contains(&Command::SpawnTunnel {
+                peer, service, bind, relayed: true,
+            });
+            prop_assert!(has_spawn);
+            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+        }
+
+        #[test]
+        fn relayed_peer_awaits_holepunch_when_cone_nat(
+            peer in arb_peer_id(),
+            service in arb_service_name(),
+            bind in arb_service_addr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::EndpointIndependent);
+            state.relayed_peers.insert(peer);
+            state.add_peer_tunnel(peer, service.clone(), bind.clone());
+
+            let (state, commands) = state.transition(Event::DhtPeerLookupComplete {
+                peer, connected: true,
+            });
+
+            let has_await = commands.contains(&Command::AwaitHolePunch { peer });
+            prop_assert!(has_await);
+            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
+        }
+
+        #[test]
+        fn tunnel_connected_relayed_skips_holepunch_when_symmetric(
+            peer in arb_peer_id(),
+            service in arb_service_name(),
+            bind in arb_service_addr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::AddressDependent);
+            state.add_peer_tunnel(peer, service.clone(), bind.clone());
+
+            let (_, commands) = state.transition(Event::TunnelPeerConnected {
+                peer, relayed: true,
+            });
+
+            let has_spawn = commands.contains(&Command::SpawnTunnel {
+                peer, service, bind, relayed: true,
+            });
+            prop_assert!(has_spawn);
+        }
+
+        #[test]
+        fn nat_mapping_detected_updates_tunnel_state(
+            mapping in prop_oneof![
+                Just(NatMapping::EndpointIndependent),
+                Just(NatMapping::AddressDependent),
+                Just(NatMapping::Unknown),
+            ],
+        ) {
+            let state = TunnelState::new();
+            let (state, commands) = state.transition(Event::NatMappingDetected(mapping));
+            prop_assert_eq!(state.nat_mapping, mapping);
+            prop_assert!(commands.is_empty());
         }
     }
 }

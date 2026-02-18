@@ -30,6 +30,7 @@ pub enum Event {
         observed_addr: Multiaddr,
     },
     NatStatusChanged(NatStatus),
+    NatMappingDetected(crate::nat_probe::NatMapping),
     DiscoveryTimeout,
     RelayReservationAccepted {
         relay_peer: PeerId,

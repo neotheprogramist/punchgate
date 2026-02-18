@@ -69,6 +69,33 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         .map(|(pid, _)| *pid)
         .collect();
 
+    let nat_mapping = match config.bootstrap_addrs.is_empty() {
+        true => {
+            tracing::info!("no bootstrap peers, skipping NAT probe");
+            crate::nat_probe::NatMapping::Unknown
+        }
+        false => {
+            tracing::info!("probing NAT type via STUN...");
+            let mapping =
+                crate::nat_probe::detect_nat_mapping(crate::nat_probe::DEFAULT_STUN_SERVERS).await;
+            match mapping {
+                crate::nat_probe::NatMapping::EndpointIndependent => {
+                    tracing::info!(nat_type = %mapping, "hole-punching viable");
+                }
+                crate::nat_probe::NatMapping::AddressDependent => {
+                    tracing::warn!(
+                        nat_type = %mapping,
+                        "hole-punching not viable, all tunnels will use relay transport"
+                    );
+                }
+                crate::nat_probe::NatMapping::Unknown => {
+                    tracing::warn!(nat_type = %mapping, "could not determine NAT type");
+                }
+            }
+            mapping
+        }
+    };
+
     let mut swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_quic()
@@ -138,6 +165,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         log_phase_transition(old_phase, new_state.phase(), commands.len());
         app_state = new_state;
         execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+
+        let old_phase = app_state.phase();
+        let (new_state, commands) = app_state.transition(Event::NatMappingDetected(nat_mapping));
+        log_phase_transition(old_phase, new_state.phase(), commands.len());
+        app_state = new_state;
+        execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
     }
 
     let discovery_deadline = tokio::time::sleep(DISCOVERY_TIMEOUT);
@@ -152,6 +185,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut holepunch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut holepunch_retries: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    let mut relayed_connections: HashSet<PeerId> = HashSet::new();
 
     let shutdown_signal = shutdown::shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -168,9 +202,21 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
+                    let addr = match endpoint {
+                        libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+                        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+                    };
+                    if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) {
+                        relayed_connections.insert(*peer_id);
+                    } else {
+                        relayed_connections.remove(peer_id);
+                    }
                 }
                 if let SwarmEvent::ConnectionClosed { peer_id, num_established, .. } = &event {
                     tracing::info!(peer = %peer_id, remaining = num_established, "connection closed");
+                    if *num_established == 0 {
+                        relayed_connections.remove(peer_id);
+                    }
                 }
 
                 if let SwarmEvent::ConnectionEstablished { peer_id, .. } = &event
@@ -236,7 +282,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     }
 
                     // NAT type detection: track external port observations per IP
+                    // Skip relay-connected peers — their observed_addr reports the relay's address
                     if let Event::PeerIdentified { peer, observed_addr, .. } = &state_event
+                        && !relayed_connections.contains(peer)
                         && let Some((ip, port)) = external_addr::extract_public_ip_port(observed_addr)
                     {
                         let ports = observed_nat_ports.entry(ip).or_default();
@@ -271,7 +319,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             tracing::warn!(
                                 peer = %remote_peer,
                                 %reason,
-                                nat = %nat_type_summary(&observed_nat_ports),
+                                nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
                                 "hole punch failed"
                             );
                             holepunch_deadlines.remove(remote_peer);
@@ -376,7 +424,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     holepunch_deadlines.remove(&peer);
                     tracing::info!(
                         %peer,
-                        nat = %nat_type_summary(&observed_nat_ports),
+                        nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
                         "hole punch timeout, falling back to relay"
                     );
                     let old_phase = app_state.phase();
@@ -466,11 +514,22 @@ fn log_phase_transition(old: Phase, new: Phase, commands: usize) {
     }
 }
 
-fn nat_type_summary(observations: &HashMap<IpAddr, HashSet<u16>>) -> &'static str {
-    let max_ports_per_ip = observations.values().map(|p| p.len()).max().unwrap_or(0);
-    match max_ports_per_ip {
-        0 => "no observations",
-        1 => "undetermined (single observer per IP)",
-        _ => "symmetric NAT likely (multiple ports per IP)",
+fn nat_type_summary(
+    stun_result: crate::nat_probe::NatMapping,
+    observations: &HashMap<IpAddr, HashSet<u16>>,
+) -> String {
+    match stun_result {
+        crate::nat_probe::NatMapping::EndpointIndependent => "cone NAT (STUN-verified)".to_string(),
+        crate::nat_probe::NatMapping::AddressDependent => {
+            "symmetric NAT (STUN-verified)".to_string()
+        }
+        crate::nat_probe::NatMapping::Unknown => {
+            let max_ports_per_ip = observations.values().map(|p| p.len()).max().unwrap_or(0);
+            match max_ports_per_ip {
+                0 => "no observations".to_string(),
+                1 => "undetermined (single observer per IP)".to_string(),
+                _ => "symmetric NAT likely (multiple ports per IP)".to_string(),
+            }
+        }
     }
 }
