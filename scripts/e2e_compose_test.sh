@@ -96,7 +96,7 @@ wait_for_container_log() {
 parse_peer_id() {
     local service="$1"
     $COMPOSE logs "$service" 2>&1 \
-        | sed 's/\x1b\[[0-9;]*m//g' \
+        | perl -pe 's/\e\[[0-9;]*m//g' \
         | grep -o 'local_peer_id=[^ ]*' \
         | head -1 \
         | cut -d= -f2
@@ -192,7 +192,7 @@ fi
 
 # Confirm the workhorse sees the client's NAT public IP (not internal IP),
 # proving traffic traverses the NAT gateways. Strip ANSI codes first.
-NAT_CONN=$($COMPOSE logs workhorse 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -c "endpoint=/ip4/10.100.0.12/" || true)
+NAT_CONN=$($COMPOSE logs workhorse 2>&1 | perl -pe 's/\e\[[0-9;]*m//g' | grep -c "endpoint=/ip4/10.100.0.12/" || true)
 
 if [[ "$NAT_CONN" -gt 0 ]]; then
     pass "NAT translation verified: workhorse sees client via nat-b (10.100.0.12)"
@@ -206,8 +206,8 @@ fi
 
 # Query each service separately — podman compose may not reliably combine
 # multi-service log output in a single invocation.
-WH_LOGS=$($COMPOSE logs workhorse 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
-CL_LOGS=$($COMPOSE logs client 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+WH_LOGS=$($COMPOSE logs workhorse 2>&1 | perl -pe 's/\e\[[0-9;]*m//g')
+CL_LOGS=$($COMPOSE logs client 2>&1 | perl -pe 's/\e\[[0-9;]*m//g')
 CLEAN_LOGS="${WH_LOGS}"$'\n'"${CL_LOGS}"
 HP_SUCCESS=$(echo "$CLEAN_LOGS" | grep -c "hole punch succeeded" || true)
 HP_FAILURE=$(echo "$CLEAN_LOGS" | grep -c "hole punch failed" || true)

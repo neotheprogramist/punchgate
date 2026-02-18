@@ -99,7 +99,7 @@ cleanup() {
     for logfile in "$PEER_A_LOG" "$PEER_B_LOG" "$ECHO_LOG"; do
         if [[ -f "$logfile" ]]; then
             name="$(basename "$logfile")"
-            sed 's/\x1b\[[0-9;]*m//g' "$logfile" > "$LOGS_DIR/$name"
+            perl -pe 's/\e\[[0-9;]*m//g' "$logfile" > "$LOGS_DIR/$name"
         fi
     done
 
@@ -171,9 +171,9 @@ log "peer B ready (pid ${PIDS[-1]})"
 
 # Parse Peer B's ID and listening address (strip ANSI codes first)
 PEER_B_LOG_CLEAN="$TMPDIR/peer-b-clean.log"
-sed 's/\x1b\[[0-9;]*m//g' "$PEER_B_LOG" > "$PEER_B_LOG_CLEAN"
-PEER_B_ID=$(grep -o 'local_peer_id=[^ ]*' "$PEER_B_LOG_CLEAN" | head -1 | cut -d= -f2)
-PEER_B_ADDR=$(grep -o 'listening on /ip4/127.0.0.1/udp/[0-9]*/quic-v1' "$PEER_B_LOG_CLEAN" | head -1 | sed 's/listening on //')
+perl -pe 's/\e\[[0-9;]*m//g' "$PEER_B_LOG" > "$PEER_B_LOG_CLEAN"
+PEER_B_ID=$(grep -ao 'local_peer_id=[^ ]*' "$PEER_B_LOG_CLEAN" | head -1 | cut -d= -f2)
+PEER_B_ADDR=$(grep -ao 'listening on /ip4/127.0.0.1/udp/[0-9]*/quic-v1' "$PEER_B_LOG_CLEAN" | head -1 | sed 's/listening on //')
 
 if [[ -z "$PEER_B_ID" || -z "$PEER_B_ADDR" ]]; then
     TEST_FAILED=1
