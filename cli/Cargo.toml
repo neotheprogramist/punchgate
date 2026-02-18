@@ -11,7 +11,10 @@ autonat = ["libp2p/autonat"]
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+crab_nat.workspace = true
+default-net.workspace = true
 futures.workspace = true
+igd-next.workspace = true
 libp2p.workspace = true
 libp2p-stream.workspace = true
 serde.workspace = true

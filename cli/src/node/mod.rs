@@ -196,6 +196,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut holepunch_retries: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
     let mut relayed_connections: HashSet<PeerId> = HashSet::new();
+    let mut port_mapping_handle: Option<
+        tokio::task::JoinHandle<Option<crate::port_mapping::PortMapping>>,
+    > = None;
+    let mut port_mapping_spawned = false;
 
     let shutdown_signal = shutdown::shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -210,6 +214,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 if let SwarmEvent::NewListenAddr { address, .. } = &event {
                     tracing::info!("listening on {address}");
                 }
+
+                if let SwarmEvent::NewListenAddr { address, .. } = &event
+                    && !port_mapping_spawned
+                    && !config.bootstrap_addrs.is_empty()
+                    && let Some(port) = extract_quic_udp_port(address)
+                {
+                    port_mapping_spawned = true;
+                    let handle = tokio::spawn(crate::port_mapping::acquire_port_mapping(port));
+                    port_mapping_handle = Some(handle);
+                    tracing::info!(port, "spawned port mapping probe");
+                }
+
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
                     let addr = match endpoint {
@@ -288,6 +304,44 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         swarm.add_external_address(address.clone());
                     } else {
                         tracing::debug!(%address, "ignoring invalid external address candidate");
+                    }
+                }
+
+                if let Some(handle) = &port_mapping_handle
+                    && handle.is_finished()
+                    && let Some(handle) = port_mapping_handle.take()
+                {
+                    match handle.await {
+                        Ok(Some(mapping)) => {
+                            // Infallible: formatted multiaddr from SocketAddr components is always valid
+                            let mapped_addr: Multiaddr = format!(
+                                "/ip4/{}/udp/{}/quic-v1",
+                                mapping.external_addr.ip(),
+                                mapping.external_addr.port()
+                            )
+                            .parse()
+                            .expect("multiaddr from SocketAddr components is always valid");
+
+                            swarm.add_external_address(mapped_addr.clone());
+                            tracing::info!(
+                                addr = %mapped_addr,
+                                protocol = mapping.protocol_used,
+                                "port mapping acquired — added external address, switching to Public NAT"
+                            );
+
+                            let old_phase = app_state.phase();
+                            let (new_state, commands) =
+                                app_state.transition(Event::NatStatusChanged(NatStatus::Public));
+                            log_phase_transition(old_phase, new_state.phase(), commands.len());
+                            app_state = new_state;
+                            execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+                        }
+                        Ok(None) => {
+                            tracing::info!("port mapping unavailable, relay path will handle connectivity");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "port mapping task panicked");
+                        }
                     }
                 }
 
@@ -604,6 +658,13 @@ async fn handle_nat_probe(
 fn extract_peer_id(addr: &Multiaddr) -> Option<PeerId> {
     addr.iter().find_map(|proto| match proto {
         libp2p::multiaddr::Protocol::P2p(peer_id) => Some(peer_id),
+        _ => None,
+    })
+}
+
+fn extract_quic_udp_port(addr: &Multiaddr) -> Option<u16> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Udp(port) => Some(port),
         _ => None,
     })
 }

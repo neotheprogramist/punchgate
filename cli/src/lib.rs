@@ -4,6 +4,7 @@ pub mod identity;
 pub mod nat_probe;
 pub mod nat_probe_protocol;
 pub mod node;
+pub mod port_mapping;
 pub mod protocol;
 pub mod shutdown;
 pub mod specs;
