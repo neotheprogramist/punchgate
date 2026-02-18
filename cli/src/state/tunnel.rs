@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId};
 
 use super::{command::Command, event::Event, peer::Phase};
 use crate::{
@@ -19,6 +19,7 @@ pub struct TunnelState {
     relayed_peers: HashSet<PeerId>,
     holepunch_failed: HashSet<PeerId>,
     nat_mapping: NatMapping,
+    peer_external_addrs: HashMap<PeerId, Vec<Multiaddr>>,
 }
 
 impl Default for TunnelState {
@@ -37,6 +38,7 @@ impl TunnelState {
             relayed_peers: HashSet::new(),
             holepunch_failed: HashSet::new(),
             nat_mapping: NatMapping::Unknown,
+            peer_external_addrs: HashMap::new(),
         }
     }
 
@@ -97,7 +99,15 @@ impl TunnelState {
                 .entry(peer)
                 .or_default()
                 .extend(specs);
-            vec![Command::AwaitHolePunch { peer }]
+            let peer_addrs = self
+                .peer_external_addrs
+                .get(&peer)
+                .cloned()
+                .unwrap_or_default();
+            vec![
+                Command::PrimeNatMapping { peer, peer_addrs },
+                Command::AwaitHolePunch { peer },
+            ]
         } else {
             specs
                 .into_iter()
@@ -183,6 +193,15 @@ impl MealyMachine for TunnelState {
                         if let Some(specs) = self.pending_by_peer.remove(&peer) {
                             if self.nat_mapping.is_holepunch_viable() {
                                 self.awaiting_holepunch.insert(peer, specs);
+                                let peer_addrs = self
+                                    .peer_external_addrs
+                                    .get(&peer)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                commands.push(Command::PrimeNatMapping {
+                                    peer,
+                                    peer_addrs: peer_addrs.clone(),
+                                });
                                 commands.push(Command::AwaitHolePunch { peer });
                             } else {
                                 commands.extend(specs.into_iter().map(|(service, bind)| {
@@ -279,6 +298,7 @@ impl MealyMachine for TunnelState {
             } => {
                 self.relayed_peers.remove(&peer);
                 self.holepunch_failed.remove(&peer);
+                self.peer_external_addrs.remove(&peer);
                 if let Some(specs) = self.awaiting_holepunch.remove(&peer) {
                     for (service, _bind) in &specs {
                         tracing::error!(
@@ -292,12 +312,25 @@ impl MealyMachine for TunnelState {
 
             Event::HolePunchRetryTick { peer } => {
                 if self.relayed_peers.contains(&peer) {
-                    commands.push(Command::RetryDirectDial { peer });
+                    let peer_addrs = self
+                        .peer_external_addrs
+                        .get(&peer)
+                        .cloned()
+                        .unwrap_or_default();
+                    commands.push(Command::PrimeAndDialDirect { peer, peer_addrs });
                 }
             }
 
             Event::NatMappingDetected(mapping) => {
                 self.nat_mapping = mapping;
+            }
+
+            Event::PeerIdentified {
+                peer, listen_addrs, ..
+            } => {
+                if !listen_addrs.is_empty() {
+                    self.peer_external_addrs.insert(peer, listen_addrs.clone());
+                }
             }
 
             Event::PhaseChanged { .. }
@@ -308,7 +341,6 @@ impl MealyMachine for TunnelState {
             | Event::KademliaBootstrapFailed { .. }
             | Event::MdnsDiscovered { .. }
             | Event::MdnsExpired { .. }
-            | Event::PeerIdentified { .. }
             | Event::NatStatusChanged(_)
             | Event::DiscoveryTimeout
             | Event::RelayReservationFailed { .. }
@@ -726,6 +758,7 @@ mod tests {
             state.relayed_peers.insert(peer);
             state.holepunch_failed.insert(peer);
             state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+            state.peer_external_addrs.insert(peer, vec![]);
 
             let (state, commands) = state.transition(Event::ConnectionLost {
                 peer, remaining_connections: 0,
@@ -735,6 +768,7 @@ mod tests {
             prop_assert!(!state.relayed_peers.contains(&peer));
             prop_assert!(!state.holepunch_failed.contains(&peer));
             prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+            prop_assert!(!state.peer_external_addrs.contains_key(&peer));
         }
 
         #[test]
@@ -827,7 +861,7 @@ mod tests {
 
             let (_, commands) = state.transition(Event::HolePunchRetryTick { peer });
 
-            let has_dial = commands.contains(&Command::RetryDirectDial { peer });
+            let has_dial = commands.iter().any(|c| matches!(c, Command::PrimeAndDialDirect { peer: p, .. } if *p == peer));
             prop_assert!(has_dial);
         }
 

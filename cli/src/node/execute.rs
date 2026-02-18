@@ -122,14 +122,58 @@ pub fn execute_commands(
                     "awaiting hole-punch — external address snapshot"
                 );
             }
-            Command::RetryDirectDial { peer } => {
-                if swarm.is_connected(peer) {
-                    tracing::debug!(%peer, "skipping retry dial — already connected");
+            Command::PrimeNatMapping { peer, peer_addrs } => {
+                let local_addr = swarm
+                    .listeners()
+                    .filter_map(crate::nat_primer::extract_udp_socket_addr)
+                    .find(|sa| match sa.ip() {
+                        std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+                        std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+                    });
+
+                if let Some(local_addr) = local_addr {
+                    let addrs = peer_addrs.clone();
+                    tokio::spawn(async move {
+                        crate::nat_primer::send_nat_priming(local_addr, &addrs).await;
+                    });
+                    tracing::info!(%peer, %local_addr, "NAT priming packets sent");
                 } else {
-                    tracing::info!(%peer, "retrying direct dial for hole-punch");
-                    match swarm.dial(*peer) {
-                        Ok(()) => {}
-                        Err(e) => tracing::debug!(%peer, error = %e, "retry dial failed"),
+                    tracing::debug!(%peer, "NAT priming skipped — no non-loopback listen address");
+                }
+            }
+            Command::PrimeAndDialDirect { peer, peer_addrs } => {
+                if swarm.is_connected(peer) {
+                    tracing::debug!(%peer, "skipping primed direct dial — already connected");
+                } else {
+                    let local_addr = swarm
+                        .listeners()
+                        .filter_map(crate::nat_primer::extract_udp_socket_addr)
+                        .find(|sa| match sa.ip() {
+                            std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+                            std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+                        });
+
+                    if let Some(local_addr) = local_addr {
+                        let addrs = peer_addrs.clone();
+                        tokio::spawn(async move {
+                            crate::nat_primer::send_nat_priming(local_addr, &addrs).await;
+                        });
+                        tracing::info!(%peer, %local_addr, "NAT priming packets sent before direct dial");
+                    }
+
+                    for addr in peer_addrs {
+                        if !addr
+                            .iter()
+                            .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                        {
+                            tracing::info!(%peer, %addr, "primed direct dial attempt");
+                            match swarm.dial(addr.clone()) {
+                                Ok(()) => break,
+                                Err(e) => {
+                                    tracing::debug!(%peer, error = %e, "primed direct dial failed")
+                                }
+                            }
+                        }
                     }
                 }
             }

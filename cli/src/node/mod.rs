@@ -424,6 +424,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 "hole punch failed"
                             );
                             holepunch_deadlines.remove(remote_peer);
+                            holepunch_retries.entry(*remote_peer)
+                                .or_insert(tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
                         }
                         Event::TunnelPeerConnected { peer, relayed: false } => {
                             holepunch_deadlines.remove(peer);
@@ -567,7 +569,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     app_state = new_state;
                     execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
 
-                    if commands.iter().any(|c| matches!(c, Command::RetryDirectDial { .. })) {
+                    if commands.iter().any(|c| matches!(c, Command::PrimeAndDialDirect { .. })) {
                         holepunch_retries.insert(peer, tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
                     }
                 }

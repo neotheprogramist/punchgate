@@ -43,7 +43,12 @@ pub enum Command {
     AwaitHolePunch {
         peer: PeerId,
     },
-    RetryDirectDial {
+    PrimeNatMapping {
         peer: PeerId,
+        peer_addrs: Vec<Multiaddr>,
+    },
+    PrimeAndDialDirect {
+        peer: PeerId,
+        peer_addrs: Vec<Multiaddr>,
     },
 }

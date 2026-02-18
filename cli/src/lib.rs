@@ -1,6 +1,7 @@
 pub mod behaviour;
 pub mod external_addr;
 pub mod identity;
+pub mod nat_primer;
 pub mod nat_probe;
 pub mod nat_probe_protocol;
 pub mod node;
