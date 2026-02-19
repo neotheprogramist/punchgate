@@ -228,14 +228,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
                 if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
-                    let addr = match endpoint {
-                        libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
-                        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+                    let is_relayed = match endpoint {
+                        libp2p::core::ConnectedPoint::Dialer { address, .. } => {
+                            address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                        }
+                        libp2p::core::ConnectedPoint::Listener { local_addr, send_back_addr } => {
+                            local_addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                                || send_back_addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+                        }
                     };
-                    if addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit)) {
-                        relayed_connections.insert(*peer_id);
-                    } else {
-                        relayed_connections.remove(peer_id);
+                    match is_relayed {
+                        true => { relayed_connections.insert(*peer_id); }
+                        false => { relayed_connections.remove(peer_id); }
                     }
                 }
                 if let SwarmEvent::ConnectionClosed { peer_id, num_established, .. } = &event {

@@ -303,13 +303,19 @@ fn extract_relay_peer_from_addrs(addrs: &[Multiaddr]) -> Option<PeerId> {
     })
 }
 
-fn is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
-    let addr = match endpoint {
-        libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
-        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
-    };
+fn has_circuit(addr: &Multiaddr) -> bool {
     addr.iter()
         .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+fn is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => has_circuit(address),
+        libp2p::core::ConnectedPoint::Listener {
+            local_addr,
+            send_back_addr,
+        } => has_circuit(local_addr) || has_circuit(send_back_addr),
+    }
 }
 
 pub fn is_active_bootstrap_result(
