@@ -18,6 +18,21 @@ pub struct ExecutionContext {
     pub tunnel_registry: TunnelRegistry,
 }
 
+fn find_local_quic_addr(swarm: &libp2p::Swarm<Behaviour>) -> Option<std::net::SocketAddr> {
+    swarm
+        .listeners()
+        .filter(|addr| {
+            !addr
+                .iter()
+                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+        })
+        .filter_map(crate::nat_primer::extract_udp_socket_addr)
+        .find(|sa| match sa.ip() {
+            std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
+            std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+        })
+}
+
 pub fn execute_commands(
     swarm: &mut libp2p::Swarm<Behaviour>,
     commands: &[Command],
@@ -123,15 +138,7 @@ pub fn execute_commands(
                 );
             }
             Command::PrimeNatMapping { peer, peer_addrs } => {
-                let local_addr = swarm
-                    .listeners()
-                    .filter_map(crate::nat_primer::extract_udp_socket_addr)
-                    .find(|sa| match sa.ip() {
-                        std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
-                        std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
-                    });
-
-                if let Some(local_addr) = local_addr {
+                if let Some(local_addr) = find_local_quic_addr(swarm) {
                     let addrs = peer_addrs.clone();
                     tokio::spawn(async move {
                         crate::nat_primer::send_nat_priming(local_addr, &addrs).await;
@@ -145,15 +152,7 @@ pub fn execute_commands(
                 if swarm.is_connected(peer) {
                     tracing::debug!(%peer, "skipping primed direct dial — already connected");
                 } else {
-                    let local_addr = swarm
-                        .listeners()
-                        .filter_map(crate::nat_primer::extract_udp_socket_addr)
-                        .find(|sa| match sa.ip() {
-                            std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
-                            std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
-                        });
-
-                    if let Some(local_addr) = local_addr {
+                    if let Some(local_addr) = find_local_quic_addr(swarm) {
                         let addrs = peer_addrs.clone();
                         tokio::spawn(async move {
                             crate::nat_primer::send_nat_priming(local_addr, &addrs).await;

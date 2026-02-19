@@ -190,18 +190,20 @@ impl MealyMachine for TunnelState {
                 match relayed {
                     true => {
                         self.relayed_peers.insert(peer);
+                        let holepunch_viable = self.nat_mapping.is_holepunch_viable();
+
                         if let Some(specs) = self.pending_by_peer.remove(&peer) {
-                            if self.nat_mapping.is_holepunch_viable() {
-                                self.awaiting_holepunch.insert(peer, specs);
+                            if holepunch_viable {
+                                self.awaiting_holepunch
+                                    .entry(peer)
+                                    .or_default()
+                                    .extend(specs);
                                 let peer_addrs = self
                                     .peer_external_addrs
                                     .get(&peer)
                                     .cloned()
                                     .unwrap_or_default();
-                                commands.push(Command::PrimeNatMapping {
-                                    peer,
-                                    peer_addrs: peer_addrs.clone(),
-                                });
+                                commands.push(Command::PrimeNatMapping { peer, peer_addrs });
                                 commands.push(Command::AwaitHolePunch { peer });
                             } else {
                                 commands.extend(specs.into_iter().map(|(service, bind)| {
@@ -213,6 +215,13 @@ impl MealyMachine for TunnelState {
                                     }
                                 }));
                             }
+                        } else if holepunch_viable {
+                            let peer_addrs = self
+                                .peer_external_addrs
+                                .get(&peer)
+                                .cloned()
+                                .unwrap_or_default();
+                            commands.push(Command::PrimeNatMapping { peer, peer_addrs });
                         }
                     }
                     false => {
@@ -954,6 +963,41 @@ mod tests {
                 peer, service, bind, relayed: true,
             });
             prop_assert!(has_spawn);
+        }
+
+        #[test]
+        fn tunnel_connected_relayed_primes_without_pending_specs(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::EndpointIndependent);
+            state.peer_external_addrs.insert(peer, vec![addr.clone()]);
+
+            let (state, commands) = state.transition(Event::TunnelPeerConnected {
+                peer, relayed: true,
+            });
+
+            let has_prime = commands.iter().any(|c| matches!(
+                c, Command::PrimeNatMapping { peer: p, .. } if *p == peer
+            ));
+            prop_assert!(has_prime, "service-exposing side must prime NAT for bidirectional hole-punching");
+            prop_assert!(state.relayed_peers.contains(&peer));
+            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+        }
+
+        #[test]
+        fn tunnel_connected_relayed_no_prime_without_specs_when_symmetric(
+            peer in arb_peer_id(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::AddressDependent);
+
+            let (_, commands) = state.transition(Event::TunnelPeerConnected {
+                peer, relayed: true,
+            });
+
+            prop_assert!(commands.is_empty());
         }
 
         #[test]
