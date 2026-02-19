@@ -18,21 +18,6 @@ pub struct ExecutionContext {
     pub tunnel_registry: TunnelRegistry,
 }
 
-fn find_local_quic_addr(swarm: &libp2p::Swarm<Behaviour>) -> Option<std::net::SocketAddr> {
-    swarm
-        .listeners()
-        .filter(|addr| {
-            !addr
-                .iter()
-                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-        })
-        .filter_map(crate::nat_primer::extract_udp_socket_addr)
-        .find(|sa| match sa.ip() {
-            std::net::IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified(),
-            std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
-        })
-}
-
 pub fn execute_commands(
     swarm: &mut libp2p::Swarm<Behaviour>,
     commands: &[Command],
@@ -137,41 +122,27 @@ pub fn execute_commands(
                     "awaiting hole-punch — external address snapshot"
                 );
             }
-            Command::PrimeNatMapping { peer, peer_addrs } => {
-                if let Some(local_addr) = find_local_quic_addr(swarm) {
-                    let addrs = peer_addrs.clone();
-                    tokio::spawn(async move {
-                        crate::nat_primer::send_nat_priming(local_addr, &addrs).await;
-                    });
-                    tracing::info!(%peer, %local_addr, "NAT priming packets sent");
-                } else {
-                    tracing::debug!(%peer, "NAT priming skipped — no non-loopback listen address");
-                }
-            }
-            Command::PrimeAndDialDirect { peer, peer_addrs } => {
-                if swarm.is_connected(peer) {
-                    tracing::debug!(%peer, "skipping primed direct dial — already connected");
-                } else {
-                    if let Some(local_addr) = find_local_quic_addr(swarm) {
-                        let addrs = peer_addrs.clone();
-                        tokio::spawn(async move {
-                            crate::nat_primer::send_nat_priming(local_addr, &addrs).await;
-                        });
-                        tracing::info!(%peer, %local_addr, "NAT priming packets sent before direct dial");
-                    }
-
-                    for addr in peer_addrs {
-                        if !addr
-                            .iter()
+            Command::PrimeNatMapping { peer, peer_addrs }
+            | Command::PrimeAndDialDirect { peer, peer_addrs } => {
+                let direct_addrs: Vec<_> = peer_addrs
+                    .iter()
+                    .filter(|a| {
+                        !a.iter()
                             .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-                        {
-                            tracing::info!(%peer, %addr, "primed direct dial attempt");
-                            match swarm.dial(addr.clone()) {
-                                Ok(()) => break,
-                                Err(e) => {
-                                    tracing::debug!(%peer, error = %e, "primed direct dial failed")
-                                }
-                            }
+                    })
+                    .cloned()
+                    .collect();
+                if direct_addrs.is_empty() {
+                    tracing::debug!(%peer, "NAT priming dial skipped — no direct addresses");
+                } else {
+                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(*peer)
+                        .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
+                        .addresses(direct_addrs)
+                        .build();
+                    match swarm.dial(opts) {
+                        Ok(()) => tracing::info!(%peer, "NAT priming via direct dial"),
+                        Err(e) => {
+                            tracing::debug!(%peer, error = %e, "NAT priming dial failed")
                         }
                     }
                 }

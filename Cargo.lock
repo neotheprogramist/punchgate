@@ -452,7 +452,6 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
- "socket2 0.5.10",
  "strum",
  "stun",
  "tempfile",
