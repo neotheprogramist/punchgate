@@ -99,15 +99,7 @@ impl TunnelState {
                 .entry(peer)
                 .or_default()
                 .extend(specs);
-            let peer_addrs = self
-                .peer_external_addrs
-                .get(&peer)
-                .cloned()
-                .unwrap_or_default();
-            vec![
-                Command::PrimeNatMapping { peer, peer_addrs },
-                Command::AwaitHolePunch { peer },
-            ]
+            vec![Command::AwaitHolePunch { peer }]
         } else {
             specs
                 .into_iter()
@@ -190,20 +182,13 @@ impl MealyMachine for TunnelState {
                 match relayed {
                     true => {
                         self.relayed_peers.insert(peer);
-                        let holepunch_viable = self.nat_mapping.is_holepunch_viable();
 
                         if let Some(specs) = self.pending_by_peer.remove(&peer) {
-                            if holepunch_viable {
+                            if self.nat_mapping.is_holepunch_viable() {
                                 self.awaiting_holepunch
                                     .entry(peer)
                                     .or_default()
                                     .extend(specs);
-                                let peer_addrs = self
-                                    .peer_external_addrs
-                                    .get(&peer)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                commands.push(Command::PrimeNatMapping { peer, peer_addrs });
                                 commands.push(Command::AwaitHolePunch { peer });
                             } else {
                                 commands.extend(specs.into_iter().map(|(service, bind)| {
@@ -215,13 +200,6 @@ impl MealyMachine for TunnelState {
                                     }
                                 }));
                             }
-                        } else if holepunch_viable {
-                            let peer_addrs = self
-                                .peer_external_addrs
-                                .get(&peer)
-                                .cloned()
-                                .unwrap_or_default();
-                            commands.push(Command::PrimeNatMapping { peer, peer_addrs });
                         }
                     }
                     false => {
@@ -339,6 +317,16 @@ impl MealyMachine for TunnelState {
             } => {
                 if !listen_addrs.is_empty() {
                     self.peer_external_addrs.insert(peer, listen_addrs.clone());
+                }
+                if self.relayed_peers.contains(&peer) && self.nat_mapping.is_holepunch_viable() {
+                    let peer_addrs = self
+                        .peer_external_addrs
+                        .get(&peer)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !peer_addrs.is_empty() {
+                        commands.push(Command::PrimeNatMapping { peer, peer_addrs });
+                    }
                 }
             }
 
@@ -966,35 +954,101 @@ mod tests {
         }
 
         #[test]
-        fn tunnel_connected_relayed_primes_without_pending_specs(
+        fn tunnel_connected_relayed_no_prime_deferred_to_peer_identified(
             peer in arb_peer_id(),
             addr in arb_multiaddr(),
         ) {
             let mut state = TunnelState::new();
             state.set_nat_mapping(NatMapping::EndpointIndependent);
-            state.peer_external_addrs.insert(peer, vec![addr.clone()]);
+            state.peer_external_addrs.insert(peer, vec![addr]);
 
             let (state, commands) = state.transition(Event::TunnelPeerConnected {
                 peer, relayed: true,
             });
 
             let has_prime = commands.iter().any(|c| matches!(
-                c, Command::PrimeNatMapping { peer: p, .. } if *p == peer
+                c, Command::PrimeNatMapping { .. }
             ));
-            prop_assert!(has_prime, "service-exposing side must prime NAT for bidirectional hole-punching");
+            prop_assert!(!has_prime, "priming deferred to PeerIdentified");
             prop_assert!(state.relayed_peers.contains(&peer));
-            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
         }
 
         #[test]
-        fn tunnel_connected_relayed_no_prime_without_specs_when_symmetric(
+        fn peer_identified_primes_relayed_peer(
             peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::EndpointIndependent);
+            state.relayed_peers.insert(peer);
+
+            let (_, commands) = state.transition(Event::PeerIdentified {
+                peer,
+                listen_addrs: vec![addr],
+                observed_addr: "/ip4/1.2.3.4/udp/5000/quic-v1"
+                    .parse()
+                    .expect("static multiaddr is always valid"),
+            });
+
+            let has_prime = commands.iter().any(|c| matches!(
+                c, Command::PrimeNatMapping { peer: p, .. } if *p == peer
+            ));
+            prop_assert!(has_prime, "must prime NAT when PeerIdentified arrives for relayed peer");
+        }
+
+        #[test]
+        fn peer_identified_no_prime_for_non_relayed_peer(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::EndpointIndependent);
+
+            let (_, commands) = state.transition(Event::PeerIdentified {
+                peer,
+                listen_addrs: vec![addr],
+                observed_addr: "/ip4/1.2.3.4/udp/5000/quic-v1"
+                    .parse()
+                    .expect("static multiaddr is always valid"),
+            });
+
+            prop_assert!(commands.is_empty());
+        }
+
+        #[test]
+        fn peer_identified_no_prime_when_symmetric_nat(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
         ) {
             let mut state = TunnelState::new();
             state.set_nat_mapping(NatMapping::AddressDependent);
+            state.relayed_peers.insert(peer);
 
-            let (_, commands) = state.transition(Event::TunnelPeerConnected {
-                peer, relayed: true,
+            let (_, commands) = state.transition(Event::PeerIdentified {
+                peer,
+                listen_addrs: vec![addr],
+                observed_addr: "/ip4/1.2.3.4/udp/5000/quic-v1"
+                    .parse()
+                    .expect("static multiaddr is always valid"),
+            });
+
+            prop_assert!(commands.is_empty());
+        }
+
+        #[test]
+        fn peer_identified_no_prime_with_empty_addrs(
+            peer in arb_peer_id(),
+        ) {
+            let mut state = TunnelState::new();
+            state.set_nat_mapping(NatMapping::EndpointIndependent);
+            state.relayed_peers.insert(peer);
+
+            let (_, commands) = state.transition(Event::PeerIdentified {
+                peer,
+                listen_addrs: vec![],
+                observed_addr: "/ip4/1.2.3.4/udp/5000/quic-v1"
+                    .parse()
+                    .expect("static multiaddr is always valid"),
             });
 
             prop_assert!(commands.is_empty());
