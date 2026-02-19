@@ -44,7 +44,6 @@ pub enum NatStatus {
 pub struct PeerState {
     pub phase: Phase,
     pub nat_status: NatStatus,
-    pub nat_mapping: crate::nat_probe::NatMapping,
     pub relay_reserved: bool,
     pub known_peers: HashMap<PeerId, HashSet<Multiaddr>>,
     pub bootstrap_peers: HashSet<PeerId>,
@@ -63,7 +62,6 @@ impl PeerState {
         Self {
             phase: Phase::Joining,
             nat_status: NatStatus::Unknown,
-            nat_mapping: crate::nat_probe::NatMapping::Unknown,
             relay_reserved: false,
             known_peers: HashMap::new(),
             bootstrap_peers: HashSet::new(),
@@ -158,10 +156,6 @@ impl MealyMachine for PeerState {
                 }
             }
 
-            Event::NatMappingDetected(mapping) => {
-                self.nat_mapping = mapping;
-            }
-
             Event::DiscoveryTimeout => match (
                 self.phase,
                 self.kad_bootstrapped,
@@ -225,7 +219,6 @@ impl MealyMachine for PeerState {
             Event::HolePunchSucceeded { .. }
             | Event::HolePunchFailed { .. }
             | Event::HolePunchTimeout { .. }
-            | Event::HolePunchRetryTick { .. }
             | Event::DhtPeerLookupComplete { .. }
             | Event::DhtServiceResolved { .. }
             | Event::DhtServiceFailed { .. }
@@ -457,19 +450,6 @@ mod tests {
 
             let (state, _) = state.transition(Event::NatStatusChanged(to_status));
             prop_assert_eq!(state.nat_status, to_status);
-        }
-
-        #[test]
-        fn nat_mapping_detected_stores_mapping(
-            mapping in prop_oneof![
-                Just(crate::nat_probe::NatMapping::EndpointIndependent),
-                Just(crate::nat_probe::NatMapping::AddressDependent),
-                Just(crate::nat_probe::NatMapping::Unknown),
-            ],
-        ) {
-            let state = PeerState::new();
-            let (state, _) = state.transition(Event::NatMappingDetected(mapping));
-            prop_assert_eq!(state.nat_mapping, mapping);
         }
 
         #[test]

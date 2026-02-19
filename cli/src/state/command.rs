@@ -40,15 +40,4 @@ pub enum Command {
         bind: ServiceAddr,
         relayed: bool,
     },
-    AwaitHolePunch {
-        peer: PeerId,
-    },
-    PrimeNatMapping {
-        peer: PeerId,
-        peer_addrs: Vec<Multiaddr>,
-    },
-    PrimeAndDialDirect {
-        peer: PeerId,
-        peer_addrs: Vec<Multiaddr>,
-    },
 }

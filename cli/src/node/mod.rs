@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder, noise, swarm::SwarmEvent, yamux};
 
@@ -22,13 +22,10 @@ use self::{
 use crate::{
     behaviour::Behaviour,
     external_addr,
-    protocol::{
-        self, DISCOVERY_TIMEOUT, HOLEPUNCH_RETRY_INTERVAL, HOLEPUNCH_TIMEOUT,
-        IDLE_CONNECTION_TIMEOUT,
-    },
+    protocol::{self, DISCOVERY_TIMEOUT, HOLEPUNCH_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
     shutdown,
     specs::{ExposedService, ServiceAddr, TunnelByNameSpec, TunnelSpec},
-    state::{AppState, Command, Event, NatStatus, PeerState, Phase, TunnelState},
+    state::{AppState, Event, NatStatus, PeerState, Phase, TunnelState},
     traits::MealyMachine,
     tunnel::TunnelRegistry,
     types::ServiceName,
@@ -114,14 +111,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("tunnel protocol already registered"))?;
     tokio::spawn(crate::tunnel::accept_loop(incoming, services.clone()));
 
-    if config.bootstrap_addrs.is_empty() {
-        let mut probe_control = swarm.behaviour().stream.new_control();
-        let probe_incoming = probe_control
-            .accept(protocol::nat_probe_protocol())
-            .map_err(|_| anyhow::anyhow!("NAT probe protocol already registered"))?;
-        tokio::spawn(nat_probe_accept_loop(probe_incoming));
-    }
-
     // Populate TunnelState with requested tunnel specs (replaces imperative HashMaps)
     let mut tunnel_state = TunnelState::new();
     for spec in &config.tunnel_specs {
@@ -134,8 +123,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     for spec in &config.tunnel_by_name_specs {
         tunnel_state.add_service_tunnel(spec.service_name.clone(), spec.bind_addr.clone());
     }
-
-    let filtering_probe_control = swarm.behaviour().stream.new_control();
+    tunnel_state.set_nat_mapping(nat_mapping);
 
     let mut ctx = ExecutionContext {
         active_bootstrap_query: None,
@@ -175,12 +163,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         log_phase_transition(old_phase, new_state.phase(), commands.len());
         app_state = new_state;
         execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
-
-        let old_phase = app_state.phase();
-        let (new_state, commands) = app_state.transition(Event::NatMappingDetected(nat_mapping));
-        log_phase_transition(old_phase, new_state.phase(), commands.len());
-        app_state = new_state;
-        execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
     }
 
     let discovery_deadline = tokio::time::sleep(DISCOVERY_TIMEOUT);
@@ -193,7 +175,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut holepunch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
-    let mut holepunch_retries: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
     let mut relayed_connections: HashSet<PeerId> = HashSet::new();
     let mut port_mapping_handle: Option<
@@ -207,7 +188,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
         let next_holepunch = holepunch_deadlines.values().min().copied();
-        let next_holepunch_retry = holepunch_retries.values().min().copied();
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -396,29 +376,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     match &state_event {
                         Event::RelayReservationAccepted { relay_peer } => {
                             tracing::info!(%relay_peer, "relay reservation accepted");
-                            if nat_mapping == crate::nat_probe::NatMapping::EndpointIndependent
-                                && let Some(&stun_server) = crate::nat_probe::DEFAULT_STUN_SERVERS.first()
-                            {
-                                let probe_ctl = filtering_probe_control.clone();
-                                let bootstrap = *relay_peer;
-                                tokio::spawn(async move {
-                                    let filtering = crate::nat_probe::probe_filtering(
-                                        probe_ctl,
-                                        bootstrap,
-                                        stun_server,
-                                    ).await;
-                                    tracing::info!(
-                                        %filtering,
-                                        %bootstrap,
-                                        "NAT filtering probe result"
-                                    );
-                                });
-                            }
                         }
                         Event::HolePunchSucceeded { remote_peer } => {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
                             holepunch_deadlines.remove(remote_peer);
-                            holepunch_retries.remove(remote_peer);
                         }
                         Event::HolePunchFailed { remote_peer, reason } => {
                             tracing::warn!(
@@ -428,16 +389,21 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 "hole punch failed"
                             );
                             holepunch_deadlines.remove(remote_peer);
-                            holepunch_retries.entry(*remote_peer)
-                                .or_insert(tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
+                        }
+                        Event::TunnelPeerConnected { peer, relayed: true } => {
+                            holepunch_deadlines.entry(*peer)
+                                .or_insert(tokio::time::Instant::now() + HOLEPUNCH_TIMEOUT);
+                            tracing::info!(
+                                %peer,
+                                timeout_secs = HOLEPUNCH_TIMEOUT.as_secs(),
+                                "hole-punch timer started"
+                            );
                         }
                         Event::TunnelPeerConnected { peer, relayed: false } => {
                             holepunch_deadlines.remove(peer);
-                            holepunch_retries.remove(peer);
                         }
                         Event::ConnectionLost { peer, remaining_connections: 0 } => {
                             holepunch_deadlines.remove(peer);
-                            holepunch_retries.remove(peer);
                         }
                         _ => {}
                     }
@@ -448,18 +414,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     log_phase_transition(old_phase, new_state.phase(), commands.len());
                     app_state = new_state;
                     execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
-
-                    for cmd in &commands {
-                        if let Command::AwaitHolePunch { peer } = cmd {
-                            holepunch_deadlines.entry(*peer)
-                                .or_insert(tokio::time::Instant::now() + HOLEPUNCH_TIMEOUT);
-                            tracing::info!(
-                                %peer,
-                                timeout_secs = HOLEPUNCH_TIMEOUT.as_secs(),
-                                "hole-punch timer started"
-                            );
-                        }
-                    }
 
                     match app_state.phase() {
                         Phase::ShuttingDown => {
@@ -545,37 +499,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     log_phase_transition(old_phase, new_state.phase(), commands.len());
                     app_state = new_state;
                     execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
-
-                    holepunch_retries.entry(peer)
-                        .or_insert(tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
-                }
-            }
-            _ = async {
-                match next_holepunch_retry {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                let now = tokio::time::Instant::now();
-                let due: Vec<PeerId> = holepunch_retries
-                    .iter()
-                    .filter(|(_, deadline)| **deadline <= now)
-                    .map(|(pid, _)| *pid)
-                    .collect();
-
-                for peer in due {
-                    holepunch_retries.remove(&peer);
-                    tracing::info!(%peer, "retrying hole-punch via direct dial");
-                    let old_phase = app_state.phase();
-                    let (new_state, commands) = app_state.transition(Event::HolePunchRetryTick { peer });
-                    tracing::debug!(event = "HolePunchRetryTick", commands = commands.len(), "event processed");
-                    log_phase_transition(old_phase, new_state.phase(), commands.len());
-                    app_state = new_state;
-                    execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
-
-                    if commands.iter().any(|c| matches!(c, Command::PrimeAndDialDirect { .. })) {
-                        holepunch_retries.insert(peer, tokio::time::Instant::now() + HOLEPUNCH_RETRY_INTERVAL);
-                    }
                 }
             }
             _ = &mut shutdown_signal => {
@@ -599,62 +522,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     ctx.tunnel_registry
         .shutdown_all(Duration::from_secs(5))
         .await;
-
-    Ok(())
-}
-
-// ─── NAT probe handler (bootstrap only) ─────────────────────────────────────
-
-async fn nat_probe_accept_loop(mut incoming: libp2p_stream::IncomingStreams) {
-    while let Some((peer_id, mut stream)) = incoming.next().await {
-        tokio::spawn(async move {
-            match handle_nat_probe(peer_id, &mut stream).await {
-                Ok(()) => {}
-                Err(e) => tracing::warn!(%peer_id, error = %e, "NAT probe handler failed"),
-            }
-        });
-    }
-}
-
-async fn handle_nat_probe(
-    peer_id: libp2p::PeerId,
-    stream: &mut libp2p::Stream,
-) -> anyhow::Result<()> {
-    use futures::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    // Infallible: u32 always fits in usize on all Rust std-supported platforms (>= 32-bit)
-    let len = usize::try_from(u32::from_be_bytes(len_buf))
-        .expect("u32 fits in usize on all supported platforms");
-    const MAX_MESSAGE_SIZE: usize = 65536;
-    anyhow::ensure!(
-        len <= MAX_MESSAGE_SIZE,
-        "NAT probe request too large: {len} bytes"
-    );
-
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;
-    let request: crate::nat_probe_protocol::NatProbeRequest = serde_json::from_slice(&buf)?;
-
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-    socket
-        .send_to(b"punchgate-nat-probe", request.mapped_addr)
-        .await?;
-
-    tracing::info!(
-        %peer_id,
-        mapped_addr = %request.mapped_addr,
-        "sent NAT filtering probe"
-    );
-
-    let response = crate::nat_probe_protocol::NatProbeResponse { probe_sent: true };
-    let data = serde_json::to_vec(&response)?;
-    let response_len =
-        u32::try_from(data.len()).context("NAT probe response too large for u32 length prefix")?;
-    stream.write_all(&response_len.to_be_bytes()).await?;
-    stream.write_all(&data).await?;
-    stream.flush().await?;
 
     Ok(())
 }

@@ -30,7 +30,6 @@ pub enum Event {
         observed_addr: Multiaddr,
     },
     NatStatusChanged(NatStatus),
-    NatMappingDetected(crate::nat_probe::NatMapping),
     DiscoveryTimeout,
     RelayReservationAccepted {
         relay_peer: PeerId,
@@ -79,10 +78,6 @@ pub enum Event {
     HolePunchTimeout {
         peer: PeerId,
     },
-    HolePunchRetryTick {
-        peer: PeerId,
-    },
-
     // ─── Bridge (synthesized by AppState) ───────────────────────────────────
     PhaseChanged {
         old: Phase,

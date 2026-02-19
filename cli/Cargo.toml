@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["autonat"]
 mdns = ["libp2p/mdns"]
 autonat = ["libp2p/autonat"]
 

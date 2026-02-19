@@ -114,39 +114,6 @@ pub fn execute_commands(
                 });
                 ctx.tunnel_registry.register(label, handle);
             }
-            Command::AwaitHolePunch { peer } => {
-                let external_addrs: Vec<_> = swarm.external_addresses().collect();
-                tracing::info!(
-                    %peer,
-                    addrs = ?external_addrs,
-                    "awaiting hole-punch — external address snapshot"
-                );
-            }
-            Command::PrimeNatMapping { peer, peer_addrs }
-            | Command::PrimeAndDialDirect { peer, peer_addrs } => {
-                let direct_addrs: Vec<_> = peer_addrs
-                    .iter()
-                    .filter(|a| {
-                        !a.iter()
-                            .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-                    })
-                    .cloned()
-                    .collect();
-                if direct_addrs.is_empty() {
-                    tracing::debug!(%peer, "NAT priming dial skipped — no direct addresses");
-                } else {
-                    let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(*peer)
-                        .condition(libp2p::swarm::dial_opts::PeerCondition::Always)
-                        .addresses(direct_addrs)
-                        .build();
-                    match swarm.dial(opts) {
-                        Ok(()) => tracing::info!(%peer, "NAT priming via direct dial"),
-                        Err(e) => {
-                            tracing::debug!(%peer, error = %e, "NAT priming dial failed")
-                        }
-                    }
-                }
-            }
         }
     }
 }
