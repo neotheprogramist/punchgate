@@ -34,6 +34,11 @@ pub enum Command {
     DialPeer {
         peer: PeerId,
     },
+    DialPeerWithAddrs {
+        peer: PeerId,
+        addrs: Vec<Multiaddr>,
+        attempt_id: u64,
+    },
     DisconnectPeer {
         peer: PeerId,
     },

@@ -219,6 +219,10 @@ impl MealyMachine for PeerState {
             Event::HolePunchSucceeded { .. }
             | Event::HolePunchFailed { .. }
             | Event::HolePunchTimeout { .. }
+            | Event::HolePunchAttemptStarted { .. }
+            | Event::HolePunchAttemptSucceeded { .. }
+            | Event::HolePunchAttemptFailed { .. }
+            | Event::HolePunchAttemptTimeout { .. }
             | Event::DhtPeerLookupComplete { .. }
             | Event::DhtServiceResolved { .. }
             | Event::DhtServiceFailed { .. }

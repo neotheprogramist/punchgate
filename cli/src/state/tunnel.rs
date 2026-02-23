@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use libp2p::PeerId;
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
 use super::{command::Command, event::Event, peer::Phase};
 use crate::{
@@ -19,7 +19,30 @@ pub struct TunnelState {
     relayed_peers: HashSet<PeerId>,
     holepunch_retry_attempts: HashMap<PeerId, u32>,
     pending_retry_redial: HashSet<PeerId>,
+    holepunch_sessions: HashMap<PeerId, HolePunchSession>,
+    address_oracle: HashMap<PeerId, PeerAddressOracle>,
     nat_mapping: NatMapping,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HolePunchSession {
+    attempt_id: u64,
+    phase: HolePunchPhase,
+    relay_redial_addrs: Vec<Multiaddr>,
+    direct_snapshot: Vec<Multiaddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HolePunchPhase {
+    Punching,
+    WaitingDisconnect,
+    WaitingRedial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct PeerAddressOracle {
+    relay_addrs: Vec<Multiaddr>,
+    direct_addrs: Vec<Multiaddr>,
 }
 
 impl Default for TunnelState {
@@ -38,6 +61,8 @@ impl TunnelState {
             relayed_peers: HashSet::new(),
             holepunch_retry_attempts: HashMap::new(),
             pending_retry_redial: HashSet::new(),
+            holepunch_sessions: HashMap::new(),
+            address_oracle: HashMap::new(),
             nat_mapping: NatMapping::Unknown,
         }
     }
@@ -109,6 +134,7 @@ impl TunnelState {
     fn clear_retry_state(&mut self, peer: &PeerId) {
         self.holepunch_retry_attempts.remove(peer);
         self.pending_retry_redial.remove(peer);
+        self.holepunch_sessions.remove(peer);
     }
 
     fn schedule_holepunch_retry(&mut self, peer: PeerId) -> u32 {
@@ -116,6 +142,128 @@ impl TunnelState {
         *attempts = attempts.saturating_add(1);
         self.pending_retry_redial.insert(peer);
         *attempts
+    }
+
+    fn update_address_oracle(&mut self, peer: PeerId, listen_addrs: Vec<Multiaddr>) {
+        let relay_addrs = dedup_addrs(
+            listen_addrs
+                .iter()
+                .filter(|addr| has_p2p_circuit(addr))
+                .cloned(),
+        );
+        let direct_addrs = dedup_addrs(
+            listen_addrs
+                .into_iter()
+                .filter(is_supported_direct_candidate),
+        );
+        if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
+            // Keep per-attempt snapshots stable once populated, but backfill empty snapshots
+            // when Identify arrives after the relayed connection.
+            if session.relay_redial_addrs.is_empty() {
+                session.relay_redial_addrs = relay_addrs.clone();
+            }
+            if session.direct_snapshot.is_empty() {
+                session.direct_snapshot = direct_addrs.clone();
+            }
+        }
+        self.address_oracle.insert(
+            peer,
+            PeerAddressOracle {
+                relay_addrs,
+                direct_addrs,
+            },
+        );
+    }
+
+    fn begin_holepunch_attempt(&mut self, peer: PeerId, attempt_id: u64) {
+        let oracle = self.address_oracle.get(&peer).cloned().unwrap_or_default();
+        self.holepunch_sessions.insert(
+            peer,
+            HolePunchSession {
+                attempt_id,
+                phase: HolePunchPhase::Punching,
+                relay_redial_addrs: oracle.relay_addrs,
+                direct_snapshot: oracle.direct_addrs,
+            },
+        );
+    }
+
+    fn retry_holepunch_attempt(
+        &mut self,
+        peer: PeerId,
+        attempt_id: u64,
+        reason: &str,
+        commands: &mut Vec<Command>,
+    ) {
+        let Some(session) = self.holepunch_sessions.get(&peer) else {
+            tracing::debug!(
+                %peer,
+                attempt_id,
+                %reason,
+                "ignoring hole-punch retry event without active session"
+            );
+            return;
+        };
+        let expected_attempt = session.attempt_id;
+        if expected_attempt != attempt_id {
+            tracing::debug!(
+                %peer,
+                expected_attempt,
+                received_attempt = attempt_id,
+                %reason,
+                "ignoring stale hole-punch retry event"
+            );
+            return;
+        }
+        if !matches!(session.phase, HolePunchPhase::Punching) {
+            tracing::debug!(
+                %peer,
+                attempt_id,
+                %reason,
+                "ignoring duplicate hole-punch retry event for non-punching phase"
+            );
+            return;
+        }
+        if !self.awaiting_holepunch.contains_key(&peer) {
+            tracing::debug!(
+                %peer,
+                attempt_id,
+                %reason,
+                "ignoring hole-punch retry event without pending direct-only tunnels"
+            );
+            return;
+        }
+        let attempt = self.schedule_holepunch_retry(peer);
+        if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
+            session.phase = HolePunchPhase::WaitingDisconnect;
+        }
+        tracing::warn!(
+            %peer,
+            attempt_id,
+            attempt,
+            %reason,
+            retry_policy = "unbounded event-driven",
+            "hole punch retry requested, reconnecting relayed path"
+        );
+        commands.push(Command::DisconnectPeer { peer });
+    }
+
+    fn retry_holepunch_legacy(&mut self, peer: PeerId, reason: &str, commands: &mut Vec<Command>) {
+        if let Some(session) = self.holepunch_sessions.get(&peer) {
+            self.retry_holepunch_attempt(peer, session.attempt_id, reason, commands);
+            return;
+        }
+        if self.awaiting_holepunch.contains_key(&peer) {
+            let attempt = self.schedule_holepunch_retry(peer);
+            tracing::warn!(
+                %peer,
+                %reason,
+                attempt,
+                retry_policy = "unbounded event-driven",
+                "legacy hole punch retry requested, reconnecting relayed path"
+            );
+            commands.push(Command::DisconnectPeer { peer });
+        }
     }
 }
 
@@ -182,6 +330,12 @@ impl MealyMachine for TunnelState {
                 self.pending_by_service.remove(&service_name);
             }
 
+            Event::PeerIdentified {
+                peer, listen_addrs, ..
+            } => {
+                self.update_address_oracle(peer, listen_addrs);
+            }
+
             Event::TunnelPeerConnected { peer, relayed } => {
                 self.dialing.remove(&peer);
                 match relayed {
@@ -218,36 +372,55 @@ impl MealyMachine for TunnelState {
                 }
             }
 
+            Event::HolePunchAttemptStarted { peer, attempt_id } => {
+                self.begin_holepunch_attempt(peer, attempt_id);
+            }
+
             Event::HolePunchSucceeded { .. } => {}
+
+            Event::HolePunchAttemptSucceeded {
+                remote_peer,
+                attempt_id,
+            } => match self.holepunch_sessions.get(&remote_peer) {
+                Some(session) if session.attempt_id == attempt_id => {}
+                Some(session) => {
+                    tracing::debug!(
+                        peer = %remote_peer,
+                        expected_attempt = session.attempt_id,
+                        received_attempt = attempt_id,
+                        "ignoring stale hole-punch success"
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        peer = %remote_peer,
+                        attempt_id,
+                        "ignoring hole-punch success without active attempt"
+                    );
+                }
+            },
 
             Event::HolePunchFailed {
                 remote_peer,
                 ref reason,
             } => {
-                if self.awaiting_holepunch.contains_key(&remote_peer) {
-                    let attempt = self.schedule_holepunch_retry(remote_peer);
-                    tracing::warn!(
-                        peer = %remote_peer,
-                        %reason,
-                        attempt,
-                        retry_policy = "unbounded event-driven",
-                        "hole punch failed, reconnecting relayed path for retry"
-                    );
-                    commands.push(Command::DisconnectPeer { peer: remote_peer });
-                }
+                self.retry_holepunch_legacy(remote_peer, reason, &mut commands);
             }
 
             Event::HolePunchTimeout { peer } => {
-                if self.awaiting_holepunch.contains_key(&peer) {
-                    let attempt = self.schedule_holepunch_retry(peer);
-                    tracing::warn!(
-                        peer = %peer,
-                        attempt,
-                        retry_policy = "unbounded event-driven",
-                        "hole punch timeout, reconnecting relayed path for retry"
-                    );
-                    commands.push(Command::DisconnectPeer { peer });
-                }
+                self.retry_holepunch_legacy(peer, "legacy timeout event", &mut commands);
+            }
+
+            Event::HolePunchAttemptFailed {
+                remote_peer,
+                attempt_id,
+                reason,
+            } => {
+                self.retry_holepunch_attempt(remote_peer, attempt_id, &reason, &mut commands);
+            }
+
+            Event::HolePunchAttemptTimeout { peer, attempt_id } => {
+                self.retry_holepunch_attempt(peer, attempt_id, "hole punch timeout", &mut commands);
             }
 
             Event::ConnectionLost {
@@ -259,7 +432,22 @@ impl MealyMachine for TunnelState {
 
                 if self.pending_retry_redial.remove(&peer) {
                     self.dialing.insert(peer);
-                    commands.push(Command::DialPeer { peer });
+                    let command = match self.holepunch_sessions.get_mut(&peer) {
+                        Some(session) => {
+                            session.phase = HolePunchPhase::WaitingRedial;
+                            if session.relay_redial_addrs.is_empty() {
+                                Command::DialPeer { peer }
+                            } else {
+                                Command::DialPeerWithAddrs {
+                                    peer,
+                                    addrs: session.relay_redial_addrs.clone(),
+                                    attempt_id: session.attempt_id,
+                                }
+                            }
+                        }
+                        None => Command::DialPeer { peer },
+                    };
+                    commands.push(command);
                     tracing::info!(%peer, "redialing peer for hole-punch retry");
                 } else if self.awaiting_holepunch.contains_key(&peer) {
                     tracing::debug!(
@@ -271,8 +459,7 @@ impl MealyMachine for TunnelState {
                 }
             }
 
-            Event::PeerIdentified { .. }
-            | Event::PhaseChanged { .. }
+            Event::PhaseChanged { .. }
             | Event::ListeningOn { .. }
             | Event::BootstrapConnected { .. }
             | Event::ShutdownRequested
@@ -293,10 +480,42 @@ impl MealyMachine for TunnelState {
     }
 }
 
+fn dedup_addrs(addrs: impl IntoIterator<Item = Multiaddr>) -> Vec<Multiaddr> {
+    let mut seen = HashSet::new();
+    addrs
+        .into_iter()
+        .filter(|addr| seen.insert(addr.clone()))
+        .collect()
+}
+
+fn has_p2p_circuit(addr: &Multiaddr) -> bool {
+    addr.iter()
+        .any(|proto| matches!(proto, Protocol::P2pCircuit))
+}
+
+fn has_udp_and_quic(addr: &Multiaddr) -> bool {
+    let mut has_udp = false;
+    let mut has_quic = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Udp(_) => has_udp = true,
+            Protocol::QuicV1 => has_quic = true,
+            Protocol::Quic => has_quic = true,
+            _ => {}
+        }
+    }
+    has_udp && has_quic
+}
+
+fn is_supported_direct_candidate(addr: &Multiaddr) -> bool {
+    !has_p2p_circuit(addr) && has_udp_and_quic(addr) && crate::external_addr::has_public_ip(addr)
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use libp2p::{Multiaddr, PeerId};
     use proptest::prelude::*;
 
     use super::*;
@@ -826,5 +1045,86 @@ mod tests {
             prop_assert!(waiting.contains(&(service, bind)));
         }
 
+    }
+
+    #[test]
+    fn stale_attempt_failure_is_ignored() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 2,
+        });
+
+        let (state, commands) = state.transition(Event::HolePunchAttemptFailed {
+            remote_peer: peer,
+            attempt_id: 1,
+            reason: "stale".to_string(),
+        });
+
+        assert!(commands.is_empty());
+        assert!(!state.pending_retry_redial.contains(&peer));
+    }
+
+    #[test]
+    fn current_attempt_timeout_requests_disconnect() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 7,
+        });
+
+        let (state, commands) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 7,
+        });
+
+        assert!(commands.contains(&Command::DisconnectPeer { peer }));
+        assert!(state.pending_retry_redial.contains(&peer));
+    }
+
+    #[test]
+    fn retry_redial_uses_relay_snapshot_addresses() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let relay_addr: Multiaddr = "/ip4/81.219.135.164/udp/4001/quic-v1/p2p/12D3KooWD8ZvJvEZ2aEXxonzcrbtgBw8ZK7NfuVLrHvX2dJQs6W3/p2p-circuit/p2p/12D3KooWJcJEadnZQzkChrKNkczWjB9grYasXYvQ4LMGmreqEPrw"
+            .parse()
+            .expect("valid relay multiaddr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![relay_addr.clone()],
+            observed_addr: relay_addr.clone(),
+        });
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 3,
+        });
+        let (state, _) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 3,
+        });
+        let (_, commands) = state.transition(Event::ConnectionLost {
+            peer,
+            remaining_connections: 0,
+        });
+
+        assert!(commands.contains(&Command::DialPeerWithAddrs {
+            peer,
+            addrs: vec![relay_addr],
+            attempt_id: 3,
+        }));
     }
 }

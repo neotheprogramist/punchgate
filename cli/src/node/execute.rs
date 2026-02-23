@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use libp2p::{Multiaddr, PeerId, kad};
+use libp2p::{
+    Multiaddr, PeerId, kad,
+    swarm::dial_opts::{DialOpts, PeerCondition},
+};
 
 use crate::{
     behaviour::Behaviour,
@@ -90,10 +93,40 @@ pub fn execute_commands(
                     .insert(query_id, service_name.clone());
                 tracing::info!(%service_name, "starting DHT provider lookup");
             }
-            Command::DialPeer { peer } => match swarm.dial(*peer) {
-                Ok(()) => tracing::info!(%peer, "dialing tunnel target"),
-                Err(e) => tracing::error!(%peer, error = %e, "failed to dial tunnel target"),
-            },
+            Command::DialPeer { peer } => {
+                let opts = DialOpts::peer_id(*peer)
+                    .condition(PeerCondition::Always)
+                    .build();
+                match swarm.dial(opts) {
+                    Ok(()) => tracing::info!(%peer, "dialing tunnel target"),
+                    Err(e) => tracing::error!(%peer, error = %e, "failed to dial tunnel target"),
+                }
+            }
+            Command::DialPeerWithAddrs {
+                peer,
+                addrs,
+                attempt_id,
+            } => {
+                let opts = DialOpts::peer_id(*peer)
+                    .addresses(addrs.clone())
+                    .condition(PeerCondition::Always)
+                    .build();
+                match swarm.dial(opts) {
+                    Ok(()) => tracing::info!(
+                        %peer,
+                        attempt_id,
+                        addrs = ?addrs,
+                        "dialing tunnel target with relay snapshot addresses"
+                    ),
+                    Err(e) => tracing::error!(
+                        %peer,
+                        attempt_id,
+                        addrs = ?addrs,
+                        error = %e,
+                        "failed to dial tunnel target with relay snapshot addresses"
+                    ),
+                }
+            }
             Command::DisconnectPeer { peer } => match swarm.disconnect_peer_id(*peer) {
                 Ok(()) => tracing::info!(%peer, "disconnecting peer for hole-punch retry"),
                 Err(()) => tracing::debug!(%peer, "disconnect skipped: peer not connected"),

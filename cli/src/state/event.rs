@@ -68,6 +68,10 @@ pub enum Event {
         peer: PeerId,
         relayed: bool,
     },
+    HolePunchAttemptStarted {
+        peer: PeerId,
+        attempt_id: u64,
+    },
     HolePunchSucceeded {
         remote_peer: PeerId,
     },
@@ -77,6 +81,19 @@ pub enum Event {
     },
     HolePunchTimeout {
         peer: PeerId,
+    },
+    HolePunchAttemptSucceeded {
+        remote_peer: PeerId,
+        attempt_id: u64,
+    },
+    HolePunchAttemptFailed {
+        remote_peer: PeerId,
+        attempt_id: u64,
+        reason: String,
+    },
+    HolePunchAttemptTimeout {
+        peer: PeerId,
+        attempt_id: u64,
     },
     // ─── Bridge (synthesized by AppState) ───────────────────────────────────
     PhaseChanged {

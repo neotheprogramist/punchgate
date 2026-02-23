@@ -53,6 +53,7 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone)]
 struct HolePunchAttemptStats {
+    attempt_id: u64,
     started_at: Instant,
     dials_started: u32,
     dials_failed: u32,
@@ -60,8 +61,9 @@ struct HolePunchAttemptStats {
 }
 
 impl HolePunchAttemptStats {
-    fn new() -> Self {
+    fn new(attempt_id: u64) -> Self {
         Self {
+            attempt_id,
             started_at: Instant::now(),
             dials_started: 0,
             dials_failed: 0,
@@ -72,6 +74,12 @@ impl HolePunchAttemptStats {
     fn elapsed_ms(&self) -> u128 {
         self.started_at.elapsed().as_millis()
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HolePunchDeadline {
+    attempt_id: u64,
+    deadline: tokio::time::Instant,
 }
 
 pub async fn run(config: NodeConfig) -> Result<()> {
@@ -209,9 +217,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut bootstrap_observed_external_by_ip: HashMap<IpAddr, Multiaddr> = HashMap::new();
     let mut relayed_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
     let mut direct_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
-    let mut hole_punch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
+    let mut hole_punch_deadlines: HashMap<PeerId, HolePunchDeadline> = HashMap::new();
     let mut hole_punch_attempts: HashMap<PeerId, HolePunchAttemptStats> = HashMap::new();
-    let mut pending_hole_punch_dials: HashMap<ConnectionId, PeerId> = HashMap::new();
+    let mut hole_punch_attempt_seq: HashMap<PeerId, u64> = HashMap::new();
+    let mut pending_hole_punch_dials: HashMap<ConnectionId, (PeerId, u64)> = HashMap::new();
     let mut port_mapping_handle: Option<
         tokio::task::JoinHandle<Option<crate::port_mapping::PortMapping>>,
     > = None;
@@ -222,7 +231,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
-        let next_hole_punch_timeout = hole_punch_deadlines.values().min().copied();
+        let next_hole_punch_timeout = hole_punch_deadlines
+            .values()
+            .map(|entry| entry.deadline)
+            .min();
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -241,6 +253,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     tracing::info!(port, "spawned port mapping probe");
                 }
 
+                let mut synthetic_events = Vec::new();
+
                 if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } = &event {
                     let is_relayed = endpoint_is_relayed(endpoint);
                     log_connection_opened(peer_id, connection_id, endpoint, is_relayed);
@@ -254,12 +268,24 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             if first_relayed_connection
                                 && !peer_has_direct_connection(&direct_connections, peer_id)
                             {
+                                let attempt_id =
+                                    next_hole_punch_attempt_id(&mut hole_punch_attempt_seq, *peer_id);
                                 hole_punch_attempts
-                                    .insert(*peer_id, HolePunchAttemptStats::new());
-                                hole_punch_deadlines
-                                    .insert(*peer_id, tokio::time::Instant::now() + HOLE_PUNCH_TIMEOUT);
+                                    .insert(*peer_id, HolePunchAttemptStats::new(attempt_id));
+                                hole_punch_deadlines.insert(
+                                    *peer_id,
+                                    HolePunchDeadline {
+                                        attempt_id,
+                                        deadline: tokio::time::Instant::now() + HOLE_PUNCH_TIMEOUT,
+                                    },
+                                );
+                                synthetic_events.push(Event::HolePunchAttemptStarted {
+                                    peer: *peer_id,
+                                    attempt_id,
+                                });
                                 tracing::info!(
                                     peer = %peer_id,
+                                    attempt_id,
                                     connection_id = ?connection_id,
                                     timeout_secs = HOLE_PUNCH_TIMEOUT.as_secs(),
                                     "relayed path active; waiting for DCUtR direct upgrade"
@@ -276,6 +302,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             if let Some(stats) = hole_punch_attempts.remove(peer_id) {
                                 tracing::info!(
                                     peer = %peer_id,
+                                    attempt_id = stats.attempt_id,
                                     connection_id = ?connection_id,
                                     elapsed_ms = stats.elapsed_ms(),
                                     dials_started = stats.dials_started,
@@ -357,19 +384,26 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 } = &event
                     && peer_is_relay_only(&relayed_connections, &direct_connections, peer_id)
                 {
-                    let stats = hole_punch_attempts
-                        .entry(*peer_id)
-                        .or_insert_with(HolePunchAttemptStats::new);
-                    stats.dials_started = stats.dials_started.saturating_add(1);
-                    pending_hole_punch_dials.insert(*connection_id, *peer_id);
-                    tracing::info!(
-                        peer = %peer_id,
-                        connection_id = ?connection_id,
-                        attempt = stats.dials_started,
-                        relayed_connections = connection_count_for_peer(&relayed_connections, peer_id),
-                        direct_connections = connection_count_for_peer(&direct_connections, peer_id),
-                        "hole-punch dial attempt started"
-                    );
+                    if let Some(stats) = hole_punch_attempts.get_mut(peer_id) {
+                        stats.dials_started = stats.dials_started.saturating_add(1);
+                        pending_hole_punch_dials
+                            .insert(*connection_id, (*peer_id, stats.attempt_id));
+                        tracing::info!(
+                            peer = %peer_id,
+                            attempt_id = stats.attempt_id,
+                            connection_id = ?connection_id,
+                            attempt = stats.dials_started,
+                            relayed_connections = connection_count_for_peer(&relayed_connections, peer_id),
+                            direct_connections = connection_count_for_peer(&direct_connections, peer_id),
+                            "hole-punch dial attempt started"
+                        );
+                    } else {
+                        tracing::debug!(
+                            peer = %peer_id,
+                            connection_id = ?connection_id,
+                            "ignoring hole-punch dial start without active attempt"
+                        );
+                    }
                 }
 
                 if let SwarmEvent::OutgoingConnectionError {
@@ -378,30 +412,45 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     error,
                 } = &event
                 {
-                    let tracked_peer = peer_id
-                        .as_ref()
+                    let tracked_attempt = pending_hole_punch_dials
+                        .get(connection_id)
                         .copied()
-                        .or_else(|| pending_hole_punch_dials.get(connection_id).copied());
+                        .or_else(|| {
+                            peer_id.as_ref().and_then(|peer| {
+                                hole_punch_attempts
+                                    .get(peer)
+                                    .map(|stats| (*peer, stats.attempt_id))
+                            })
+                        });
 
-                    if let Some(peer) = tracked_peer
+                    if let Some((peer, attempt_id)) = tracked_attempt
                         && peer_is_relay_only(&relayed_connections, &direct_connections, &peer)
-                    {
-                        let stats = hole_punch_attempts
-                            .entry(peer)
-                            .or_insert_with(HolePunchAttemptStats::new);
-                        stats.dials_failed = stats.dials_failed.saturating_add(1);
-                        stats.last_dial_error = Some(error.to_string());
-                        tracing::warn!(
-                            peer = %peer,
-                            connection_id = ?connection_id,
-                            attempt = stats.dials_started,
-                            failures = stats.dials_failed,
-                            error = %error,
-                            relayed_connections = connection_count_for_peer(&relayed_connections, &peer),
-                            direct_connections = connection_count_for_peer(&direct_connections, &peer),
-                            "hole-punch dial attempt failed"
-                        );
-                    }
+                        && let Some(stats) = hole_punch_attempts.get_mut(&peer) {
+                            if stats.attempt_id == attempt_id {
+                                stats.dials_failed = stats.dials_failed.saturating_add(1);
+                                stats.last_dial_error = Some(error.to_string());
+                                tracing::warn!(
+                                    peer = %peer,
+                                    attempt_id,
+                                    connection_id = ?connection_id,
+                                    attempt = stats.dials_started,
+                                    failures = stats.dials_failed,
+                                    error = %error,
+                                    relayed_connections = connection_count_for_peer(&relayed_connections, &peer),
+                                    direct_connections = connection_count_for_peer(&direct_connections, &peer),
+                                    "hole-punch dial attempt failed"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    peer = %peer,
+                                    expected_attempt = stats.attempt_id,
+                                    received_attempt = attempt_id,
+                                    connection_id = ?connection_id,
+                                    error = %error,
+                                    "ignoring stale hole-punch dial failure"
+                                );
+                            }
+                        }
 
                     pending_hole_punch_dials.remove(connection_id);
                 }
@@ -495,8 +544,10 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     }
                 }
 
-                // Translate swarm event → domain events, then feed through state machine
-                let events = translate_swarm_event(
+                // Translate swarm event → domain events, then feed through state machine.
+                // `synthetic_events` are runtime-generated attempt lifecycle events emitted
+                // from connection bookkeeping above.
+                let translated_events = translate_swarm_event(
                     &event,
                     &bootstrap_peer_ids,
                     ctx.active_bootstrap_query,
@@ -505,7 +556,48 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     |peer| swarm.is_connected(peer),
                 );
 
+                let mut events = synthetic_events;
+                events.extend(translated_events);
+
                 for state_event in events {
+                    let state_event = match state_event {
+                        Event::HolePunchSucceeded { remote_peer } => {
+                            match hole_punch_attempts.get(&remote_peer) {
+                                Some(stats) => Event::HolePunchAttemptSucceeded {
+                                    remote_peer,
+                                    attempt_id: stats.attempt_id,
+                                },
+                                None => {
+                                    tracing::debug!(
+                                        peer = %remote_peer,
+                                        "ignoring hole-punch success without active attempt stats"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Event::HolePunchFailed {
+                            remote_peer,
+                            reason,
+                        } => {
+                            match hole_punch_attempts.get(&remote_peer) {
+                                Some(stats) => Event::HolePunchAttemptFailed {
+                                    remote_peer,
+                                    attempt_id: stats.attempt_id,
+                                    reason,
+                                },
+                                None => {
+                                    tracing::debug!(
+                                        peer = %remote_peer,
+                                        "ignoring hole-punch failure without active attempt stats"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        other => other,
+                    };
+
                     // Bootstrap server: confirm observed addresses from Identify
                     // (first node has nobody to AutoNAT it)
                     if bootstrap_peer_ids.is_empty()
@@ -649,14 +741,15 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 "DHT provider lookup failed"
                             );
                         }
+                        Event::HolePunchAttemptStarted { peer, attempt_id } => {
+                            tracing::info!(
+                                peer = %peer,
+                                attempt_id,
+                                known_addrs = ?known_addrs_for_peer(&app_state, peer),
+                                "hole-punch attempt started"
+                            );
+                        }
                         Event::TunnelPeerConnected { peer, relayed } => {
-                            if *relayed {
-                                hole_punch_attempts
-                                    .entry(*peer)
-                                    .or_insert_with(HolePunchAttemptStats::new);
-                                hole_punch_deadlines
-                                    .insert(*peer, tokio::time::Instant::now() + HOLE_PUNCH_TIMEOUT);
-                            }
                             tracing::info!(
                                 peer = %peer,
                                 relayed,
@@ -669,11 +762,24 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         Event::RelayReservationAccepted { relay_peer } => {
                             tracing::info!(%relay_peer, "relay reservation accepted");
                         }
-                        Event::HolePunchSucceeded { remote_peer } => {
+                        Event::HolePunchAttemptSucceeded {
+                            remote_peer,
+                            attempt_id,
+                        } => {
                             let known_addrs = known_addrs_for_peer(&app_state, remote_peer);
                             if let Some(stats) = hole_punch_attempts.remove(remote_peer) {
+                                if stats.attempt_id != *attempt_id {
+                                    tracing::debug!(
+                                        peer = %remote_peer,
+                                        expected_attempt = stats.attempt_id,
+                                        received_attempt = attempt_id,
+                                        "ignoring stale hole-punch success event"
+                                    );
+                                    continue;
+                                }
                                 tracing::info!(
                                     peer = %remote_peer,
+                                    attempt_id,
                                     elapsed_ms = stats.elapsed_ms(),
                                     dials_started = stats.dials_started,
                                     dial_failures = stats.dials_failed,
@@ -686,6 +792,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             } else {
                                 tracing::info!(
                                     peer = %remote_peer,
+                                    attempt_id,
                                     direct_connections = connection_count_for_peer(&direct_connections, remote_peer),
                                     relayed_connections = connection_count_for_peer(&relayed_connections, remote_peer),
                                     known_addrs = ?known_addrs,
@@ -698,11 +805,25 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             );
                             hole_punch_deadlines.remove(remote_peer);
                         }
-                        Event::HolePunchFailed { remote_peer, reason } => {
+                        Event::HolePunchAttemptFailed {
+                            remote_peer,
+                            attempt_id,
+                            reason,
+                        } => {
                             let known_addrs = known_addrs_for_peer(&app_state, remote_peer);
-                            if let Some(stats) = hole_punch_attempts.remove(remote_peer) {
+                            if let Some(stats) = hole_punch_attempts.get(remote_peer) {
+                                if stats.attempt_id != *attempt_id {
+                                    tracing::debug!(
+                                        peer = %remote_peer,
+                                        expected_attempt = stats.attempt_id,
+                                        received_attempt = attempt_id,
+                                        "ignoring stale hole-punch failure event"
+                                    );
+                                    continue;
+                                }
                                 tracing::warn!(
                                     peer = %remote_peer,
+                                    attempt_id,
                                     %reason,
                                     nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
                                     elapsed_ms = stats.elapsed_ms(),
@@ -717,6 +838,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             } else {
                                 tracing::warn!(
                                     peer = %remote_peer,
+                                    attempt_id,
                                     %reason,
                                     nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
                                     direct_connections = connection_count_for_peer(&direct_connections, remote_peer),
@@ -725,11 +847,17 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                     "hole punch failed"
                                 );
                             }
-                            remove_pending_hole_punch_dials_for_peer(
-                                &mut pending_hole_punch_dials,
-                                remote_peer,
+                        }
+                        Event::HolePunchAttemptTimeout { peer, attempt_id } => {
+                            tracing::warn!(
+                                peer = %peer,
+                                attempt_id,
+                                timeout_secs = HOLE_PUNCH_TIMEOUT.as_secs(),
+                                direct_connections = connection_count_for_peer(&direct_connections, peer),
+                                relayed_connections = connection_count_for_peer(&relayed_connections, peer),
+                                known_addrs = ?known_addrs_for_peer(&app_state, peer),
+                                "hole punch timeout reached without direct upgrade; scheduling retry"
                             );
-                            hole_punch_deadlines.remove(remote_peer);
                         }
                         _ => {}
                     }
@@ -803,25 +931,23 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
             } => {
                 let now = tokio::time::Instant::now();
-                let due: Vec<PeerId> = hole_punch_deadlines
+                let due: Vec<(PeerId, u64)> = hole_punch_deadlines
                     .iter()
-                    .filter(|(_, deadline)| **deadline <= now)
-                    .map(|(pid, _)| *pid)
+                    .filter(|(_, entry)| entry.deadline <= now)
+                    .map(|(pid, entry)| (*pid, entry.attempt_id))
                     .collect();
 
-                for peer in due {
+                for (peer, attempt_id) in due {
                     hole_punch_deadlines.remove(&peer);
 
                     if peer_is_relay_only(&relayed_connections, &direct_connections, &peer) {
-                        tracing::warn!(
-                            %peer,
-                            timeout_secs = HOLE_PUNCH_TIMEOUT.as_secs(),
-                            "hole punch timeout reached without direct upgrade; scheduling retry"
-                        );
                         let old_phase = app_state.phase();
-                        let (new_state, commands) = app_state.transition(Event::HolePunchTimeout { peer });
+                        let (new_state, commands) = app_state.transition(Event::HolePunchAttemptTimeout {
+                            peer,
+                            attempt_id,
+                        });
                         tracing::debug!(
-                            event = "HolePunchTimeout",
+                            event = "HolePunchAttemptTimeout",
                             commands = commands.len(),
                             "event processed"
                         );
@@ -972,10 +1098,16 @@ fn connection_count_for_peer(
 }
 
 fn remove_pending_hole_punch_dials_for_peer(
-    pending_by_connection: &mut HashMap<ConnectionId, PeerId>,
+    pending_by_connection: &mut HashMap<ConnectionId, (PeerId, u64)>,
     peer: &PeerId,
 ) {
-    pending_by_connection.retain(|_, tracked_peer| tracked_peer != peer);
+    pending_by_connection.retain(|_, (tracked_peer, _)| tracked_peer != peer);
+}
+
+fn next_hole_punch_attempt_id(sequences: &mut HashMap<PeerId, u64>, peer: PeerId) -> u64 {
+    let entry = sequences.entry(peer).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
 }
 
 fn known_addrs_for_peer(app_state: &AppState, peer: &PeerId) -> Vec<String> {
