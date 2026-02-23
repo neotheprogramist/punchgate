@@ -40,6 +40,8 @@ use crate::{
 
 // ─── Main entry ─────────────────────────────────────────────────────────────
 
+const HOLE_PUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct NodeConfig {
     pub identity_path: PathBuf,
     pub listen_addrs: Vec<Multiaddr>,
@@ -203,9 +205,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    let mut confirmed_external_by_ip: HashMap<IpAddr, Multiaddr> = HashMap::new();
     let mut bootstrap_observed_external_by_ip: HashMap<IpAddr, Multiaddr> = HashMap::new();
     let mut relayed_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
     let mut direct_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
+    let mut hole_punch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut hole_punch_attempts: HashMap<PeerId, HolePunchAttemptStats> = HashMap::new();
     let mut pending_hole_punch_dials: HashMap<ConnectionId, PeerId> = HashMap::new();
     let mut port_mapping_handle: Option<
@@ -218,6 +222,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
+        let next_hole_punch_timeout = hole_punch_deadlines.values().min().copied();
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -251,9 +256,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             {
                                 hole_punch_attempts
                                     .insert(*peer_id, HolePunchAttemptStats::new());
+                                hole_punch_deadlines
+                                    .insert(*peer_id, tokio::time::Instant::now() + HOLE_PUNCH_TIMEOUT);
                                 tracing::info!(
                                     peer = %peer_id,
                                     connection_id = ?connection_id,
+                                    timeout_secs = HOLE_PUNCH_TIMEOUT.as_secs(),
                                     "relayed path active; waiting for DCUtR direct upgrade"
                                 );
                             }
@@ -280,6 +288,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 &mut pending_hole_punch_dials,
                                 peer_id,
                             );
+                            hole_punch_deadlines.remove(peer_id);
                             if let Some(relayed_ids) = relayed_connections.remove(peer_id) {
                                 for relayed_id in relayed_ids {
                                     if swarm.close_connection(relayed_id) {
@@ -314,6 +323,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         relayed_connections.remove(peer_id);
                         direct_connections.remove(peer_id);
                         hole_punch_attempts.remove(peer_id);
+                        hole_punch_deadlines.remove(peer_id);
                         remove_pending_hole_punch_dials_for_peer(
                             &mut pending_hole_punch_dials,
                             peer_id,
@@ -411,17 +421,37 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
 
                 if let SwarmEvent::ExternalAddrConfirmed { address } = &event {
+                    if let Some((ip, _)) = external_addr::extract_public_ip_port(address) {
+                        let previous = confirmed_external_by_ip.insert(ip, address.clone());
+                        if let Some(prev_addr) = previous.as_ref()
+                            && prev_addr != address
+                        {
+                            swarm.remove_external_address(prev_addr);
+                            tracing::info!(
+                                observed_ip = %ip,
+                                old_addr = %prev_addr,
+                                new_addr = %address,
+                                "replaced stale confirmed external address"
+                            );
+                        }
+                    }
                     tracing::info!(%address, "external address confirmed");
                 }
 
                 if let SwarmEvent::ExternalAddrExpired { address } = &event {
+                    if let Some((ip, _)) = external_addr::extract_public_ip_port(address)
+                        && confirmed_external_by_ip
+                            .get(&ip)
+                            .is_some_and(|current| current == address)
+                    {
+                        confirmed_external_by_ip.remove(&ip);
+                    }
                     tracing::warn!(%address, "external address expired");
                 }
 
                 if let SwarmEvent::NewExternalAddrCandidate { address } = &event {
                     if external_addr::is_valid_external_candidate(address) {
-                        tracing::info!(%address, "new external address candidate (confirming)");
-                        swarm.add_external_address(address.clone());
+                        tracing::info!(%address, "new external address candidate");
                     } else {
                         tracing::debug!(%address, "ignoring invalid external address candidate");
                     }
@@ -624,6 +654,8 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 hole_punch_attempts
                                     .entry(*peer)
                                     .or_insert_with(HolePunchAttemptStats::new);
+                                hole_punch_deadlines
+                                    .insert(*peer, tokio::time::Instant::now() + HOLE_PUNCH_TIMEOUT);
                             }
                             tracing::info!(
                                 peer = %peer,
@@ -664,6 +696,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 &mut pending_hole_punch_dials,
                                 remote_peer,
                             );
+                            hole_punch_deadlines.remove(remote_peer);
                         }
                         Event::HolePunchFailed { remote_peer, reason } => {
                             let known_addrs = known_addrs_for_peer(&app_state, remote_peer);
@@ -696,6 +729,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 &mut pending_hole_punch_dials,
                                 remote_peer,
                             );
+                            hole_punch_deadlines.remove(remote_peer);
                         }
                         _ => {}
                     }
@@ -759,6 +793,41 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            _ = async {
+                match next_hole_punch_timeout {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                let now = tokio::time::Instant::now();
+                let due: Vec<PeerId> = hole_punch_deadlines
+                    .iter()
+                    .filter(|(_, deadline)| **deadline <= now)
+                    .map(|(pid, _)| *pid)
+                    .collect();
+
+                for peer in due {
+                    hole_punch_deadlines.remove(&peer);
+
+                    if peer_is_relay_only(&relayed_connections, &direct_connections, &peer) {
+                        tracing::warn!(
+                            %peer,
+                            timeout_secs = HOLE_PUNCH_TIMEOUT.as_secs(),
+                            "hole punch timeout reached without direct upgrade; scheduling retry"
+                        );
+                        let old_phase = app_state.phase();
+                        let (new_state, commands) = app_state.transition(Event::HolePunchTimeout { peer });
+                        tracing::debug!(
+                            event = "HolePunchTimeout",
+                            commands = commands.len(),
+                            "event processed"
+                        );
+                        log_phase_transition(old_phase, new_state.phase(), commands.len());
+                        app_state = new_state;
+                        execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
                     }
                 }
             }
