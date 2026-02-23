@@ -412,16 +412,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     error,
                 } = &event
                 {
-                    let tracked_attempt = pending_hole_punch_dials
-                        .get(connection_id)
-                        .copied()
-                        .or_else(|| {
-                            peer_id.as_ref().and_then(|peer| {
-                                hole_punch_attempts
-                                    .get(peer)
-                                    .map(|stats| (*peer, stats.attempt_id))
-                            })
-                        });
+                    let tracked_attempt = pending_hole_punch_dials.get(connection_id).copied();
 
                     if let Some((peer, attempt_id)) = tracked_attempt
                         && peer_is_relay_only(&relayed_connections, &direct_connections, &peer)
@@ -450,7 +441,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                     "ignoring stale hole-punch dial failure"
                                 );
                             }
-                        }
+                    } else if let Some(peer) = peer_id.as_ref()
+                        && peer_is_relay_only(&relayed_connections, &direct_connections, peer)
+                    {
+                        tracing::debug!(
+                            peer = %peer,
+                            connection_id = ?connection_id,
+                            error = %error,
+                            "ignoring untracked dial failure while relay-only"
+                        );
+                    }
 
                     pending_hole_punch_dials.remove(connection_id);
                 }
@@ -560,43 +560,27 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 events.extend(translated_events);
 
                 for state_event in events {
-                    let state_event = match state_event {
+                    match &state_event {
                         Event::HolePunchSucceeded { remote_peer } => {
-                            match hole_punch_attempts.get(&remote_peer) {
-                                Some(stats) => Event::HolePunchAttemptSucceeded {
-                                    remote_peer,
-                                    attempt_id: stats.attempt_id,
-                                },
-                                None => {
-                                    tracing::debug!(
-                                        peer = %remote_peer,
-                                        "ignoring hole-punch success without active attempt stats"
-                                    );
-                                    continue;
-                                }
-                            }
+                            tracing::debug!(
+                                peer = %remote_peer,
+                                "ignoring raw DCUtR success event; direct connection events are authoritative"
+                            );
+                            continue;
                         }
                         Event::HolePunchFailed {
                             remote_peer,
                             reason,
                         } => {
-                            match hole_punch_attempts.get(&remote_peer) {
-                                Some(stats) => Event::HolePunchAttemptFailed {
-                                    remote_peer,
-                                    attempt_id: stats.attempt_id,
-                                    reason,
-                                },
-                                None => {
-                                    tracing::debug!(
-                                        peer = %remote_peer,
-                                        "ignoring hole-punch failure without active attempt stats"
-                                    );
-                                    continue;
-                                }
-                            }
+                            tracing::debug!(
+                                peer = %remote_peer,
+                                %reason,
+                                "ignoring raw DCUtR failure event; retries are attempt-scoped"
+                            );
+                            continue;
                         }
-                        other => other,
-                    };
+                        _ => {}
+                    }
 
                     // Bootstrap server: confirm observed addresses from Identify
                     // (first node has nobody to AutoNAT it)

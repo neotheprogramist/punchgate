@@ -23,6 +23,25 @@ fn prefer_public_addr(addrs: &HashSet<Multiaddr>) -> Option<&Multiaddr> {
         .or_else(|| addrs.iter().next())
 }
 
+fn extract_public_ip(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    crate::external_addr::extract_public_ip_port(addr).map(|(ip, _)| ip)
+}
+
+fn replace_stale_public_addr_for_ip(entry: &mut HashSet<Multiaddr>, addr: &Multiaddr) {
+    let Some(ip) = extract_public_ip(addr) else {
+        return;
+    };
+    entry.retain(|known| {
+        if known == addr {
+            return true;
+        }
+        match extract_public_ip(known) {
+            Some(known_ip) => known_ip != ip,
+            None => true,
+        }
+    });
+}
+
 // ─── State types (product of orthogonal coproducts) ─────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display)]
@@ -194,8 +213,9 @@ impl MealyMachine for PeerState {
             } => {
                 let entry = self.known_peers.entry(peer).or_default();
                 for addr in &listen_addrs {
-                    entry.insert(addr.clone());
-                    if crate::external_addr::has_public_ip(addr) {
+                    replace_stale_public_addr_for_ip(entry, addr);
+                    let inserted = entry.insert(addr.clone());
+                    if inserted && crate::external_addr::has_public_ip(addr) {
                         commands.push(Command::KademliaAddAddress {
                             peer,
                             addr: addr.clone(),
@@ -619,14 +639,20 @@ mod tests {
 
             let stored = new_state.known_peers.get(&peer)
                 .expect("peer should be in known_peers after PeerIdentified");
-            for addr in &addrs {
-                prop_assert!(stored.contains(addr));
+            for addr in stored {
+                prop_assert!(addrs.contains(addr));
             }
 
-            let kad_add_count = commands.iter()
-                .filter(|c| matches!(c, Command::KademliaAddAddress { .. }))
-                .count();
-            prop_assert_eq!(kad_add_count, addrs.len());
+            let kad_addrs: Vec<_> = commands.iter()
+                .filter_map(|c| match c {
+                    Command::KademliaAddAddress { peer: p, addr } if *p == peer => Some(addr),
+                    _ => None,
+                })
+                .collect();
+            prop_assert!(!kad_addrs.is_empty());
+            for addr in kad_addrs {
+                prop_assert!(addrs.contains(addr));
+            }
         }
 
         #[test]
@@ -912,5 +938,35 @@ mod tests {
             prop_assert!(!state.relay_reserved);
             prop_assert_eq!(state.phase, Phase::Ready);
         }
+    }
+
+    #[test]
+    fn peer_identified_replaces_stale_public_addr_for_same_ip() {
+        let peer = libp2p::PeerId::random();
+        let old_addr: Multiaddr = "/ip4/203.0.113.10/udp/41000/quic-v1"
+            .parse()
+            .expect("static multiaddr should parse");
+        let new_addr: Multiaddr = "/ip4/203.0.113.10/udp/42000/quic-v1"
+            .parse()
+            .expect("static multiaddr should parse");
+
+        let state = PeerState::new();
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![old_addr.clone()],
+            observed_addr: old_addr,
+        });
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![new_addr.clone()],
+            observed_addr: new_addr.clone(),
+        });
+
+        let stored = state
+            .known_peers
+            .get(&peer)
+            .expect("peer should be known after identify events");
+        assert_eq!(stored.len(), 1);
+        assert!(stored.contains(&new_addr));
     }
 }

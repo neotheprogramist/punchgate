@@ -247,24 +247,6 @@ impl TunnelState {
         );
         commands.push(Command::DisconnectPeer { peer });
     }
-
-    fn retry_holepunch_legacy(&mut self, peer: PeerId, reason: &str, commands: &mut Vec<Command>) {
-        if let Some(session) = self.holepunch_sessions.get(&peer) {
-            self.retry_holepunch_attempt(peer, session.attempt_id, reason, commands);
-            return;
-        }
-        if self.awaiting_holepunch.contains_key(&peer) {
-            let attempt = self.schedule_holepunch_retry(peer);
-            tracing::warn!(
-                %peer,
-                %reason,
-                attempt,
-                retry_policy = "unbounded event-driven",
-                "legacy hole punch retry requested, reconnecting relayed path"
-            );
-            commands.push(Command::DisconnectPeer { peer });
-        }
-    }
 }
 
 impl MealyMachine for TunnelState {
@@ -400,15 +382,18 @@ impl MealyMachine for TunnelState {
                 }
             },
 
-            Event::HolePunchFailed {
-                remote_peer,
-                ref reason,
-            } => {
-                self.retry_holepunch_legacy(remote_peer, reason, &mut commands);
+            Event::HolePunchFailed { remote_peer, .. } => {
+                tracing::debug!(
+                    peer = %remote_peer,
+                    "ignoring legacy hole-punch failure event"
+                );
             }
 
             Event::HolePunchTimeout { peer } => {
-                self.retry_holepunch_legacy(peer, "legacy timeout event", &mut commands);
+                tracing::debug!(
+                    peer = %peer,
+                    "ignoring legacy hole-punch timeout event"
+                );
             }
 
             Event::HolePunchAttemptFailed {
@@ -721,7 +706,7 @@ mod tests {
         }
 
         #[test]
-        fn hole_punch_failed_triggers_disconnect_retry(
+        fn hole_punch_failed_legacy_event_is_noop(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -734,11 +719,10 @@ mod tests {
                 remote_peer: peer, reason,
             });
 
-            let has_disconnect = commands.contains(&Command::DisconnectPeer { peer });
-            prop_assert!(has_disconnect);
+            prop_assert!(commands.is_empty());
             prop_assert!(state.awaiting_holepunch.contains_key(&peer));
-            prop_assert!(state.pending_retry_redial.contains(&peer));
-            prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(1));
+            prop_assert!(!state.pending_retry_redial.contains(&peer));
+            prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), None);
         }
 
         #[test]
@@ -820,7 +804,7 @@ mod tests {
         }
 
         #[test]
-        fn holepunch_failed_then_connection_lost_redials(
+        fn holepunch_failed_legacy_then_connection_lost_does_not_redial(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -834,23 +818,21 @@ mod tests {
                 remote_peer: peer,
                 reason,
             });
-            let has_disconnect = fail_cmds.contains(&Command::DisconnectPeer { peer });
-            prop_assert!(has_disconnect);
+            prop_assert!(fail_cmds.is_empty());
 
             let (state, reconnect_cmds) = state.transition(Event::ConnectionLost {
                 peer,
                 remaining_connections: 0,
             });
 
-            let has_redial = reconnect_cmds.contains(&Command::DialPeer { peer });
-            prop_assert!(has_redial);
+            prop_assert!(reconnect_cmds.is_empty());
             prop_assert!(state.awaiting_holepunch.contains_key(&peer));
             prop_assert!(!state.pending_retry_redial.contains(&peer));
-            prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(1));
+            prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), None);
         }
 
         #[test]
-        fn holepunch_failed_keeps_retrying_after_many_attempts(
+        fn holepunch_failed_legacy_ignores_existing_retry_counter(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -868,17 +850,16 @@ mod tests {
                 reason,
             });
 
-            let has_disconnect = commands.contains(&Command::DisconnectPeer { peer });
-            prop_assert!(has_disconnect);
-            prop_assert!(state.pending_retry_redial.contains(&peer));
+            prop_assert!(commands.is_empty());
+            prop_assert!(!state.pending_retry_redial.contains(&peer));
             prop_assert_eq!(
                 state.holepunch_retry_attempts.get(&peer).copied(),
-                Some(1_001)
+                Some(1_000)
             );
         }
 
         #[test]
-        fn holepunch_timeout_keeps_waiting_tunnels(
+        fn holepunch_timeout_legacy_event_is_noop(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -889,14 +870,13 @@ mod tests {
 
             let (state, commands) = state.transition(Event::HolePunchTimeout { peer });
 
-            let has_disconnect = commands.contains(&Command::DisconnectPeer { peer });
-            prop_assert!(has_disconnect);
+            prop_assert!(commands.is_empty());
             let waiting = state
                 .awaiting_holepunch
                 .get(&peer)
                 .expect("peer remains queued after hole punch timeout");
             prop_assert!(waiting.contains(&(service, bind)));
-            prop_assert!(state.pending_retry_redial.contains(&peer));
+            prop_assert!(!state.pending_retry_redial.contains(&peer));
         }
 
         #[test]
