@@ -12,22 +12,26 @@ use std::{
 
 use anyhow::Result;
 use futures::StreamExt;
-use libp2p::{Multiaddr, PeerId, SwarmBuilder, noise, swarm::SwarmEvent, yamux};
+use libp2p::{
+    Multiaddr, PeerId, SwarmBuilder, noise,
+    swarm::{ConnectionId, SwarmEvent},
+    yamux,
+};
 
 use self::{
     backoff::ReconnectBackoff,
-    execute::{ExecutionContext, execute_commands, publish_services},
+    execute::{ExecutionContext, execute_commands},
     translate::translate_swarm_event,
 };
 use crate::{
     behaviour::Behaviour,
     external_addr,
-    protocol::{self, DISCOVERY_TIMEOUT, HOLEPUNCH_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
+    protocol::{self, DISCOVERY_TIMEOUT, IDLE_CONNECTION_TIMEOUT},
     shutdown,
     specs::{ExposedService, ServiceAddr, TunnelByNameSpec, TunnelSpec},
     state::{AppState, Event, NatStatus, PeerState, Phase, TunnelState},
     traits::MealyMachine,
-    tunnel::TunnelRegistry,
+    tunnel::{DirectPeerRegistry, TunnelRegistry},
     types::ServiceName,
 };
 
@@ -82,7 +86,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 crate::nat_probe::NatMapping::AddressDependent => {
                     tracing::warn!(
                         nat_type = %mapping,
-                        "hole-punching not viable, all tunnels will use relay transport"
+                        "hole-punching not viable, tunnel activation requires direct connectivity"
                     );
                 }
                 crate::nat_probe::NatMapping::Unknown => {
@@ -130,6 +134,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         kad_tunnel_queries: HashMap::new(),
         kad_service_queries: HashMap::new(),
         stream_control,
+        direct_peers: DirectPeerRegistry::new(),
         tunnel_registry: TunnelRegistry::new(),
     };
 
@@ -169,14 +174,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     tokio::pin!(discovery_deadline);
     let mut discovery_timeout_fired = false;
 
-    let mut republish_interval = tokio::time::interval(protocol::SERVICE_REPUBLISH_INTERVAL);
-    republish_interval.tick().await;
-
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
-    let mut holepunch_deadlines: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
-    let mut relayed_connections: HashSet<PeerId> = HashSet::new();
+    let mut relayed_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
+    let mut direct_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
     let mut port_mapping_handle: Option<
         tokio::task::JoinHandle<Option<crate::port_mapping::PortMapping>>,
     > = None;
@@ -187,7 +189,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
 
     loop {
         let next_reconnect = pending_reconnects.values().min().copied();
-        let next_holepunch = holepunch_deadlines.values().min().copied();
 
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -206,26 +207,47 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     tracing::info!(port, "spawned port mapping probe");
                 }
 
-                if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
+                if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } = &event {
                     tracing::info!(peer = %peer_id, endpoint = %endpoint.get_remote_address(), "connection opened");
-                    let is_relayed = match endpoint {
-                        libp2p::core::ConnectedPoint::Dialer { address, .. } => {
-                            address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-                        }
-                        libp2p::core::ConnectedPoint::Listener { local_addr, send_back_addr } => {
-                            local_addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-                                || send_back_addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-                        }
-                    };
+                    let is_relayed = endpoint_is_relayed(endpoint);
                     match is_relayed {
-                        true => { relayed_connections.insert(*peer_id); }
-                        false => { relayed_connections.remove(peer_id); }
+                        true => {
+                            relayed_connections
+                                .entry(*peer_id)
+                                .or_default()
+                                .insert(*connection_id);
+                        }
+                        false => {
+                            direct_connections
+                                .entry(*peer_id)
+                                .or_default()
+                                .insert(*connection_id);
+                            ctx.direct_peers.mark_direct(*peer_id).await;
+                            if let Some(relayed_ids) = relayed_connections.remove(peer_id) {
+                                for relayed_id in relayed_ids {
+                                    if swarm.close_connection(relayed_id) {
+                                        tracing::info!(
+                                            peer = %peer_id,
+                                            connection_id = ?relayed_id,
+                                            "closed relayed connection after direct upgrade"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                if let SwarmEvent::ConnectionClosed { peer_id, num_established, .. } = &event {
+                if let SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } = &event {
                     tracing::info!(peer = %peer_id, remaining = num_established, "connection closed");
+                    remove_connection_id(&mut relayed_connections, peer_id, connection_id);
+                    let direct_exhausted = remove_connection_id(&mut direct_connections, peer_id, connection_id);
+
+                    if direct_exhausted || *num_established == 0 {
+                        ctx.direct_peers.clear_direct(peer_id).await;
+                    }
                     if *num_established == 0 {
                         relayed_connections.remove(peer_id);
+                        direct_connections.remove(peer_id);
                     }
                 }
 
@@ -260,25 +282,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         %peer_id,
                         delay_secs = delay.as_secs(),
                         "rescheduling bootstrap reconnect after failed dial"
-                    );
-                }
-
-                if let SwarmEvent::Dialing { peer_id: Some(peer_id), .. } = &event
-                    && holepunch_deadlines.contains_key(peer_id)
-                {
-                    tracing::info!(
-                        peer = %peer_id,
-                        "hole-punch dial attempt in progress"
-                    );
-                }
-
-                if let SwarmEvent::OutgoingConnectionError { peer_id: Some(peer_id), error, .. } = &event
-                    && holepunch_deadlines.contains_key(peer_id)
-                {
-                    tracing::info!(
-                        peer = %peer_id,
-                        error = %error,
-                        "hole-punch dial attempt failed"
                     );
                 }
 
@@ -321,7 +324,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
                         }
                         Ok(None) => {
-                            tracing::info!("port mapping unavailable, relay path will handle connectivity");
+                            tracing::info!("port mapping unavailable, relying on DCUtR direct connectivity");
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "port mapping task panicked");
@@ -351,7 +354,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     // NAT type detection: track external port observations per IP
                     // Skip relay-connected peers — their observed_addr reports the relay's address
                     if let Event::PeerIdentified { peer, observed_addr, .. } = &state_event
-                        && !relayed_connections.contains(peer)
+                        && !peer_has_relayed_connection(&relayed_connections, peer)
                         && let Some((ip, port)) = external_addr::extract_public_ip_port(observed_addr)
                     {
                         let ports = observed_nat_ports.entry(ip).or_default();
@@ -363,11 +366,18 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                     observed_port = port,
                                     "NAT mapping observed"
                                 ),
-                                _ => tracing::warn!(
+                                _ if matches!(nat_mapping, crate::nat_probe::NatMapping::Unknown) => tracing::warn!(
                                     observer = %peer,
                                     observed_ip = %ip,
                                     observed_ports = ?ports,
-                                    "symmetric NAT likely — multiple external ports for same IP, hole-punching will fail"
+                                    "symmetric NAT likely — multiple external ports for same IP, hole-punching may fail"
+                                ),
+                                _ => tracing::debug!(
+                                    observer = %peer,
+                                    observed_ip = %ip,
+                                    observed_ports = ?ports,
+                                    nat = %nat_mapping,
+                                    "multiple external ports observed; keeping STUN-derived NAT classification"
                                 ),
                             }
                         }
@@ -379,7 +389,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         }
                         Event::HolePunchSucceeded { remote_peer } => {
                             tracing::info!(peer = %remote_peer, "hole punch succeeded");
-                            holepunch_deadlines.remove(remote_peer);
                         }
                         Event::HolePunchFailed { remote_peer, reason } => {
                             tracing::warn!(
@@ -388,22 +397,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
                                 "hole punch failed"
                             );
-                            holepunch_deadlines.remove(remote_peer);
-                        }
-                        Event::TunnelPeerConnected { peer, relayed: true } => {
-                            holepunch_deadlines.entry(*peer)
-                                .or_insert(tokio::time::Instant::now() + HOLEPUNCH_TIMEOUT);
-                            tracing::info!(
-                                %peer,
-                                timeout_secs = HOLEPUNCH_TIMEOUT.as_secs(),
-                                "hole-punch timer started"
-                            );
-                        }
-                        Event::TunnelPeerConnected { peer, relayed: false } => {
-                            holepunch_deadlines.remove(peer);
-                        }
-                        Event::ConnectionLost { peer, remaining_connections: 0 } => {
-                            holepunch_deadlines.remove(peer);
                         }
                         _ => {}
                     }
@@ -438,9 +431,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 app_state = new_state;
                 execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
             }
-            _ = republish_interval.tick(), if app_state.phase() == Phase::Ready => {
-                publish_services(&mut swarm, &config.exposed);
-            }
             _ = async {
                 match next_reconnect {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -471,34 +461,6 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             }
                         }
                     }
-                }
-            }
-            _ = async {
-                match next_holepunch {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                let now = tokio::time::Instant::now();
-                let due: Vec<PeerId> = holepunch_deadlines
-                    .iter()
-                    .filter(|(_, deadline)| **deadline <= now)
-                    .map(|(pid, _)| *pid)
-                    .collect();
-
-                for peer in due {
-                    holepunch_deadlines.remove(&peer);
-                    tracing::info!(
-                        %peer,
-                        nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
-                        "hole punch timeout, falling back to relay"
-                    );
-                    let old_phase = app_state.phase();
-                    let (new_state, commands) = app_state.transition(Event::HolePunchTimeout { peer });
-                    tracing::debug!(event = "HolePunchTimeout", commands = commands.len(), "event processed");
-                    log_phase_transition(old_phase, new_state.phase(), commands.len());
-                    app_state = new_state;
-                    execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
                 }
             }
             _ = &mut shutdown_signal => {
@@ -540,6 +502,48 @@ fn extract_quic_udp_port(addr: &Multiaddr) -> Option<u16> {
         libp2p::multiaddr::Protocol::Udp(port) => Some(port),
         _ => None,
     })
+}
+
+fn endpoint_is_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    fn has_circuit(addr: &Multiaddr) -> bool {
+        addr.iter()
+            .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+    }
+
+    match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => has_circuit(address),
+        libp2p::core::ConnectedPoint::Listener {
+            local_addr,
+            send_back_addr,
+        } => has_circuit(local_addr) || has_circuit(send_back_addr),
+    }
+}
+
+fn remove_connection_id(
+    by_peer: &mut HashMap<PeerId, HashSet<ConnectionId>>,
+    peer: &PeerId,
+    connection_id: &ConnectionId,
+) -> bool {
+    match by_peer.get_mut(peer) {
+        Some(ids) => {
+            ids.remove(connection_id);
+            match ids.is_empty() {
+                true => {
+                    by_peer.remove(peer);
+                    true
+                }
+                false => false,
+            }
+        }
+        None => false,
+    }
+}
+
+fn peer_has_relayed_connection(
+    by_peer: &HashMap<PeerId, HashSet<ConnectionId>>,
+    peer: &PeerId,
+) -> bool {
+    by_peer.contains_key(peer)
 }
 
 fn log_phase_transition(old: Phase, new: Phase, commands: usize) {

@@ -381,66 +381,71 @@ async fn service_discovery_tunnel() {
         let mut discovered_provider: Option<PeerId> = None;
         let mut connected_to_provider = false;
         let mut tx_result = Some(tx_c_result);
-        let mut retry_interval = tokio::time::interval(Duration::from_secs(2));
-        retry_interval.tick().await; // skip first immediate tick
 
         loop {
-            tokio::select! {
-                event = swarm_c.select_next_some() => {
-                    match event {
-                        SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_a => {
-                            if !bootstrapped {
-                                let _ = swarm_c.behaviour_mut().kademlia.bootstrap();
-                                bootstrapped = true;
-                            }
-                        }
-                        SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
-                            kad::Event::OutboundQueryProgressed {
-                                result: kad::QueryResult::Bootstrap(Ok(_)),
-                                ..
-                            },
-                        )) if !queried_providers => {
-                            queried_providers = true;
-                            let key = cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
-                            let record_key = kad::RecordKey::new(&key);
-                            swarm_c.behaviour_mut().kademlia.get_providers(record_key);
-                        }
-                        SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
-                            kad::Event::OutboundQueryProgressed {
-                                result:
-                                    kad::QueryResult::GetProviders(Ok(
-                                        kad::GetProvidersOk::FoundProviders { providers, .. },
-                                    )),
-                                ..
-                            },
-                        )) if discovered_provider.is_none() => {
-                            if let Some(&provider) = providers.iter().next() {
-                                discovered_provider = Some(provider);
-                                // Kademlia may have already connected to B during queries
-                                if !swarm_c.is_connected(&provider) {
-                                    let provider_addr = addr_b
-                                        .clone()
-                                        .with(libp2p::multiaddr::Protocol::P2p(provider));
-                                    swarm_c.dial(provider_addr).expect("C dial provider");
-                                } else {
-                                    connected_to_provider = true;
-                                }
-                            }
-                        }
-                        SwarmEvent::ConnectionEstablished { peer_id, .. }
-                            if Some(peer_id) == discovered_provider && !connected_to_provider =>
-                        {
-                            connected_to_provider = true;
-                        }
-                        _ => {}
+            let event = swarm_c.select_next_some().await;
+            match event {
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer_a => {
+                    if !bootstrapped {
+                        let _ = swarm_c.behaviour_mut().kademlia.bootstrap();
+                        bootstrapped = true;
                     }
                 }
-                // Retry get_providers periodically (DHT may need time to propagate)
-                _ = retry_interval.tick(), if queried_providers && discovered_provider.is_none() => {
-                    let key = cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
+                SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        result: kad::QueryResult::Bootstrap(Ok(_)),
+                        ..
+                    },
+                )) if !queried_providers => {
+                    queried_providers = true;
+                    let key =
+                        cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
                     let record_key = kad::RecordKey::new(&key);
                     swarm_c.behaviour_mut().kademlia.get_providers(record_key);
                 }
+                SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        result:
+                            kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                                providers,
+                                ..
+                            })),
+                        ..
+                    },
+                )) if discovered_provider.is_none() => {
+                    if let Some(&provider) = providers.iter().next() {
+                        discovered_provider = Some(provider);
+                        // Kademlia may have already connected to B during queries
+                        if !swarm_c.is_connected(&provider) {
+                            let provider_addr = addr_b
+                                .clone()
+                                .with(libp2p::multiaddr::Protocol::P2p(provider));
+                            swarm_c.dial(provider_addr).expect("C dial provider");
+                        } else {
+                            connected_to_provider = true;
+                        }
+                    }
+                }
+                SwarmEvent::Behaviour(TestBehaviourEvent::Kademlia(
+                    kad::Event::OutboundQueryProgressed {
+                        result:
+                            kad::QueryResult::GetProviders(Ok(
+                                kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
+                            )),
+                        ..
+                    },
+                )) if queried_providers && discovered_provider.is_none() => {
+                    let key =
+                        cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
+                    let record_key = kad::RecordKey::new(&key);
+                    swarm_c.behaviour_mut().kademlia.get_providers(record_key);
+                }
+                SwarmEvent::ConnectionEstablished { peer_id, .. }
+                    if Some(peer_id) == discovered_provider && !connected_to_provider =>
+                {
+                    connected_to_provider = true;
+                }
+                _ => {}
             }
 
             // Once connected to the discovered provider, open tunnel and verify echo

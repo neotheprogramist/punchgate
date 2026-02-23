@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use futures::io::{AsyncReadExt as FuturesAsyncReadExt, AsyncWriteExt as FuturesAsyncWriteExt};
@@ -13,6 +17,31 @@ use tokio::{
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::{protocol, specs::ServiceAddr, types::ServiceName};
+
+#[derive(Clone, Default)]
+pub struct DirectPeerRegistry {
+    peers: Arc<tokio::sync::RwLock<HashSet<PeerId>>>,
+}
+
+impl DirectPeerRegistry {
+    pub fn new() -> Self {
+        Self {
+            peers: Arc::new(tokio::sync::RwLock::new(HashSet::new())),
+        }
+    }
+
+    pub async fn mark_direct(&self, peer: PeerId) {
+        self.peers.write().await.insert(peer);
+    }
+
+    pub async fn clear_direct(&self, peer: &PeerId) {
+        self.peers.write().await.remove(peer);
+    }
+
+    pub async fn is_direct(&self, peer: &PeerId) -> bool {
+        self.peers.read().await.contains(peer)
+    }
+}
 
 // ─── Wire format ────────────────────────────────────────────────────────────
 
@@ -149,6 +178,7 @@ pub async fn connect_tunnel(
     remote_peer: PeerId,
     service_name: ServiceName,
     bind_addr: ServiceAddr,
+    direct_peers: DirectPeerRegistry,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr.connect_tuple())
         .await
@@ -165,6 +195,17 @@ pub async fn connect_tunnel(
     loop {
         let (tcp_stream, client_addr) = listener.accept().await?;
         tracing::debug!(%client_addr, "new tunnel client");
+
+        if !direct_peers.is_direct(&remote_peer).await {
+            tracing::warn!(
+                %remote_peer,
+                %client_addr,
+                service = %service_name,
+                "direct connection unavailable, rejecting tunnel client"
+            );
+            drop(tcp_stream);
+            continue;
+        }
 
         let service_name = service_name.clone();
         let mut stream = control

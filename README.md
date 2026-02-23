@@ -135,7 +135,7 @@ cargo run -p cli -- \
   --expose ssh=127.0.0.1:22
 ```
 
-Any peer with `--bootstrap` is automatically treated as behind NAT: it requests a relay circuit and publishes the `ssh` service to the DHT. If DCUtR hole-punching later succeeds, traffic flows directly between peers; otherwise it falls back to relayed transport.
+Any peer with `--bootstrap` is automatically treated as behind NAT: it requests a relay circuit and publishes the `ssh` service to the DHT. The relay is used only to coordinate DCUtR; tunnel activation is deferred until a direct (non-relayed) connection is established.
 
 **Node 3 — Client (tunnel to workhorse's SSH by name):**
 
@@ -153,7 +153,7 @@ The client discovers the `ssh` provider via the Kademlia DHT — no need to know
 ssh -p 2222 user@127.0.0.1
 ```
 
-The data path: `ssh → TCP:2222 → Client → [DCUtR direct or relay] → Workhorse → TCP:22 → sshd`.
+The data path: `ssh → TCP:2222 → Client → DCUtR direct path → Workhorse → TCP:22 → sshd`.
 
 ## Production Deployment
 
@@ -198,7 +198,7 @@ All other nodes need this peer ID and the bootstrap's public IP to join the mesh
 
 ### Non-Bootstrap Peer (Behind NAT)
 
-Peers behind NAT do not publish any ports. They connect outbound to bootstrap and receive inbound traffic through relay circuits or DCUtR hole-punched connections.
+Peers behind NAT do not publish any ports. They connect outbound to bootstrap and reserve relay circuits for coordination, but tunnel traffic is permitted only on direct DCUtR-upgraded connections.
 
 Create the env file:
 
@@ -239,7 +239,7 @@ The connection upgrade path:
 
 1. **Relay** — NATed peers reserve a relay circuit through bootstrap on connect
 2. **DCUtR hole punch** — both peers attempt simultaneous QUIC connections to punch through their NATs
-3. **Direct** — if hole-punching succeeds, tunnels use the direct connection; otherwise relay is the fallback
+3. **Direct-only tunnel activation** — tunnels start only after a non-relayed connection is confirmed; there is no relay fallback for tunnel data
 
 For dynamic NAT detection, enable the `autonat` feature at build time.
 

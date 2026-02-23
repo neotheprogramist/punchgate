@@ -15,6 +15,7 @@ pub struct ExecutionContext {
     pub kad_tunnel_queries: HashMap<kad::QueryId, PeerId>,
     pub kad_service_queries: HashMap<kad::QueryId, ServiceName>,
     pub stream_control: libp2p_stream::Control,
+    pub direct_peers: tunnel::DirectPeerRegistry,
     pub tunnel_registry: TunnelRegistry,
 }
 
@@ -97,17 +98,16 @@ pub fn execute_commands(
                 peer,
                 service,
                 bind,
-                relayed,
             } => {
                 let control = ctx.stream_control.clone();
                 let peer = *peer;
                 let svc = service.clone();
                 let addr = bind.clone();
-                let relayed = *relayed;
+                let direct_peers = ctx.direct_peers.clone();
                 let label = format!("{peer}:{svc}@{addr}");
-                tracing::info!(%peer, service = %svc, bind = %addr, relayed, "spawning tunnel");
+                tracing::info!(%peer, service = %svc, bind = %addr, "spawning tunnel");
                 let handle = tokio::spawn(async move {
-                    match tunnel::connect_tunnel(control, peer, svc, addr).await {
+                    match tunnel::connect_tunnel(control, peer, svc, addr, direct_peers).await {
                         Ok(()) => {}
                         Err(e) => tracing::error!(error = %e, "tunnel failed"),
                     }
