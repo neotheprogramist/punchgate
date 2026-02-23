@@ -10,8 +10,6 @@ use crate::{
     types::{KademliaKey, ServiceName},
 };
 
-const MAX_HOLEPUNCH_RETRIES: u8 = 3;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelState {
     pending_by_peer: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
@@ -19,7 +17,7 @@ pub struct TunnelState {
     dialing: HashSet<PeerId>,
     awaiting_holepunch: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
     relayed_peers: HashSet<PeerId>,
-    holepunch_retry_attempts: HashMap<PeerId, u8>,
+    holepunch_retry_attempts: HashMap<PeerId, u32>,
     pending_retry_redial: HashSet<PeerId>,
     nat_mapping: NatMapping,
 }
@@ -113,16 +111,11 @@ impl TunnelState {
         self.pending_retry_redial.remove(peer);
     }
 
-    fn schedule_holepunch_retry(&mut self, peer: PeerId) -> Option<u8> {
+    fn schedule_holepunch_retry(&mut self, peer: PeerId) -> u32 {
         let attempts = self.holepunch_retry_attempts.entry(peer).or_insert(0);
-        match *attempts < MAX_HOLEPUNCH_RETRIES {
-            true => {
-                *attempts = attempts.saturating_add(1);
-                self.pending_retry_redial.insert(peer);
-                Some(*attempts)
-            }
-            false => None,
-        }
+        *attempts = attempts.saturating_add(1);
+        self.pending_retry_redial.insert(peer);
+        *attempts
     }
 }
 
@@ -232,49 +225,28 @@ impl MealyMachine for TunnelState {
                 ref reason,
             } => {
                 if self.awaiting_holepunch.contains_key(&remote_peer) {
-                    match self.schedule_holepunch_retry(remote_peer) {
-                        Some(attempt) => {
-                            tracing::warn!(
-                                peer = %remote_peer,
-                                %reason,
-                                attempt,
-                                max_attempts = MAX_HOLEPUNCH_RETRIES,
-                                "hole punch failed, reconnecting relayed path for retry"
-                            );
-                            commands.push(Command::DisconnectPeer { peer: remote_peer });
-                        }
-                        None => {
-                            tracing::error!(
-                                peer = %remote_peer,
-                                %reason,
-                                max_attempts = MAX_HOLEPUNCH_RETRIES,
-                                "hole punch retry budget exhausted"
-                            );
-                        }
-                    }
+                    let attempt = self.schedule_holepunch_retry(remote_peer);
+                    tracing::warn!(
+                        peer = %remote_peer,
+                        %reason,
+                        attempt,
+                        retry_policy = "unbounded event-driven",
+                        "hole punch failed, reconnecting relayed path for retry"
+                    );
+                    commands.push(Command::DisconnectPeer { peer: remote_peer });
                 }
             }
 
             Event::HolePunchTimeout { peer } => {
                 if self.awaiting_holepunch.contains_key(&peer) {
-                    match self.schedule_holepunch_retry(peer) {
-                        Some(attempt) => {
-                            tracing::warn!(
-                                peer = %peer,
-                                attempt,
-                                max_attempts = MAX_HOLEPUNCH_RETRIES,
-                                "hole punch timeout, reconnecting relayed path for retry"
-                            );
-                            commands.push(Command::DisconnectPeer { peer });
-                        }
-                        None => {
-                            tracing::error!(
-                                peer = %peer,
-                                max_attempts = MAX_HOLEPUNCH_RETRIES,
-                                "hole punch timeout and retry budget exhausted"
-                            );
-                        }
-                    }
+                    let attempt = self.schedule_holepunch_retry(peer);
+                    tracing::warn!(
+                        peer = %peer,
+                        attempt,
+                        retry_policy = "unbounded event-driven",
+                        "hole punch timeout, reconnecting relayed path for retry"
+                    );
+                    commands.push(Command::DisconnectPeer { peer });
                 }
             }
 
@@ -659,7 +631,7 @@ mod tests {
         }
 
         #[test]
-        fn holepunch_failed_exhausted_budget_does_not_retry(
+        fn holepunch_failed_keeps_retrying_after_many_attempts(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -670,18 +642,19 @@ mod tests {
                 .insert(peer, vec![(service, bind)]);
             state
                 .holepunch_retry_attempts
-                .insert(peer, MAX_HOLEPUNCH_RETRIES);
+                .insert(peer, 1_000);
 
             let (state, commands) = state.transition(Event::HolePunchFailed {
                 remote_peer: peer,
                 reason,
             });
 
-            prop_assert!(commands.is_empty());
-            prop_assert!(!state.pending_retry_redial.contains(&peer));
+            let has_disconnect = commands.contains(&Command::DisconnectPeer { peer });
+            prop_assert!(has_disconnect);
+            prop_assert!(state.pending_retry_redial.contains(&peer));
             prop_assert_eq!(
                 state.holepunch_retry_attempts.get(&peer).copied(),
-                Some(MAX_HOLEPUNCH_RETRIES)
+                Some(1_001)
             );
         }
 

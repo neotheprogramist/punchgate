@@ -14,7 +14,10 @@ use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder, noise,
-    swarm::{ConnectionId, SwarmEvent},
+    swarm::{
+        ConnectionId, NetworkBehaviour, SwarmEvent,
+        behaviour::{FromSwarm, NewExternalAddrCandidate},
+    },
     yamux,
 };
 
@@ -200,6 +203,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut backoff = ReconnectBackoff::new(&bootstrap_peers_with_addrs);
     let mut pending_reconnects: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
+    let mut bootstrap_observed_external_by_ip: HashMap<IpAddr, Multiaddr> = HashMap::new();
     let mut relayed_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
     let mut direct_connections: HashMap<PeerId, HashSet<ConnectionId>> = HashMap::new();
     let mut hole_punch_attempts: HashMap<PeerId, HolePunchAttemptStats> = HashMap::new();
@@ -478,6 +482,50 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         && let Event::PeerIdentified { observed_addr, .. } = &state_event
                     {
                         swarm.add_external_address(observed_addr.clone());
+                    }
+
+                    // For non-bootstrap nodes, treat direct observations by bootstrap peers as
+                    // authoritative and refresh the external address advertised to peers.
+                    if let Event::PeerIdentified {
+                        peer,
+                        observed_addr,
+                        ..
+                    } = &state_event
+                        && bootstrap_peer_ids.contains(peer)
+                        && !peer_has_relayed_connection(&relayed_connections, peer)
+                        && external_addr::is_valid_external_candidate(observed_addr)
+                        && let Some((ip, port)) = external_addr::extract_public_ip_port(observed_addr)
+                    {
+                        let previous = bootstrap_observed_external_by_ip
+                            .insert(ip, observed_addr.clone());
+
+                        if let Some(prev_addr) = previous.as_ref()
+                            && prev_addr != observed_addr
+                        {
+                            swarm.remove_external_address(prev_addr);
+                            tracing::info!(
+                                observer = %peer,
+                                observed_ip = %ip,
+                                old_addr = %prev_addr,
+                                new_addr = %observed_addr,
+                                "bootstrap observation replaced stale external address"
+                            );
+                        }
+
+                        if previous.as_ref() != Some(observed_addr) {
+                            swarm.add_external_address(observed_addr.clone());
+                            swarm.behaviour_mut().dcutr.on_swarm_event(
+                                FromSwarm::NewExternalAddrCandidate(NewExternalAddrCandidate {
+                                    addr: observed_addr,
+                                }),
+                            );
+                            tracing::info!(
+                                observer = %peer,
+                                observed_ip = %ip,
+                                observed_port = port,
+                                "bootstrap observation refreshed external address for DCUtR"
+                            );
+                        }
                     }
 
                     // NAT type detection: track external port observations per IP
