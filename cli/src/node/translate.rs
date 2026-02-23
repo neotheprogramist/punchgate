@@ -219,13 +219,27 @@ fn translate_behaviour_event(
         }
 
         BehaviourEvent::Dcutr(event) => match &event.result {
-            Ok(_) => vec![Event::HolePunchSucceeded {
-                remote_peer: event.remote_peer_id,
-            }],
-            Err(e) => vec![Event::HolePunchFailed {
-                remote_peer: event.remote_peer_id,
-                reason: format!("{e}"),
-            }],
+            Ok(connection_id) => {
+                tracing::info!(
+                    peer = %event.remote_peer_id,
+                    connection_id = ?connection_id,
+                    "dcutr upgraded relayed path to direct connection"
+                );
+                vec![Event::HolePunchSucceeded {
+                    remote_peer: event.remote_peer_id,
+                }]
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = %event.remote_peer_id,
+                    error = %e,
+                    "dcutr reported hole-punch failure"
+                );
+                vec![Event::HolePunchFailed {
+                    remote_peer: event.remote_peer_id,
+                    reason: format!("{e}"),
+                }]
+            }
         },
 
         BehaviourEvent::RelayServer(_) => vec![],
