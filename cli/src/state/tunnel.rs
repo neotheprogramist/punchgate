@@ -10,6 +10,8 @@ use crate::{
     types::{KademliaKey, ServiceName},
 };
 
+const MAX_HOLEPUNCH_RETRIES: u8 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelState {
     pending_by_peer: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
@@ -17,6 +19,8 @@ pub struct TunnelState {
     dialing: HashSet<PeerId>,
     awaiting_holepunch: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
     relayed_peers: HashSet<PeerId>,
+    holepunch_retry_attempts: HashMap<PeerId, u8>,
+    pending_retry_redial: HashSet<PeerId>,
     nat_mapping: NatMapping,
 }
 
@@ -34,6 +38,8 @@ impl TunnelState {
             dialing: HashSet::new(),
             awaiting_holepunch: HashMap::new(),
             relayed_peers: HashSet::new(),
+            holepunch_retry_attempts: HashMap::new(),
+            pending_retry_redial: HashSet::new(),
             nat_mapping: NatMapping::Unknown,
         }
     }
@@ -100,6 +106,23 @@ impl TunnelState {
             .entry(peer)
             .or_default()
             .extend(specs);
+    }
+
+    fn clear_retry_state(&mut self, peer: &PeerId) {
+        self.holepunch_retry_attempts.remove(peer);
+        self.pending_retry_redial.remove(peer);
+    }
+
+    fn schedule_holepunch_retry(&mut self, peer: PeerId) -> Option<u8> {
+        let attempts = self.holepunch_retry_attempts.entry(peer).or_insert(0);
+        match *attempts < MAX_HOLEPUNCH_RETRIES {
+            true => {
+                *attempts = attempts.saturating_add(1);
+                self.pending_retry_redial.insert(peer);
+                Some(*attempts)
+            }
+            false => None,
+        }
     }
 }
 
@@ -185,6 +208,7 @@ impl MealyMachine for TunnelState {
                     }
                     false => {
                         self.relayed_peers.remove(&peer);
+                        self.clear_retry_state(&peer);
                         commands.extend(
                             self.pending_by_peer
                                 .remove(&peer)
@@ -208,20 +232,49 @@ impl MealyMachine for TunnelState {
                 ref reason,
             } => {
                 if self.awaiting_holepunch.contains_key(&remote_peer) {
-                    tracing::info!(
-                        peer = %remote_peer,
-                        reason = %reason,
-                        "hole punch failed, waiting for direct reconnection"
-                    );
+                    match self.schedule_holepunch_retry(remote_peer) {
+                        Some(attempt) => {
+                            tracing::warn!(
+                                peer = %remote_peer,
+                                %reason,
+                                attempt,
+                                max_attempts = MAX_HOLEPUNCH_RETRIES,
+                                "hole punch failed, reconnecting relayed path for retry"
+                            );
+                            commands.push(Command::DisconnectPeer { peer: remote_peer });
+                        }
+                        None => {
+                            tracing::error!(
+                                peer = %remote_peer,
+                                %reason,
+                                max_attempts = MAX_HOLEPUNCH_RETRIES,
+                                "hole punch retry budget exhausted"
+                            );
+                        }
+                    }
                 }
             }
 
             Event::HolePunchTimeout { peer } => {
                 if self.awaiting_holepunch.contains_key(&peer) {
-                    tracing::info!(
-                        peer = %peer,
-                        "hole punch timeout, waiting for direct reconnection"
-                    );
+                    match self.schedule_holepunch_retry(peer) {
+                        Some(attempt) => {
+                            tracing::warn!(
+                                peer = %peer,
+                                attempt,
+                                max_attempts = MAX_HOLEPUNCH_RETRIES,
+                                "hole punch timeout, reconnecting relayed path for retry"
+                            );
+                            commands.push(Command::DisconnectPeer { peer });
+                        }
+                        None => {
+                            tracing::error!(
+                                peer = %peer,
+                                max_attempts = MAX_HOLEPUNCH_RETRIES,
+                                "hole punch timeout and retry budget exhausted"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -230,14 +283,19 @@ impl MealyMachine for TunnelState {
                 remaining_connections: 0,
             } => {
                 self.relayed_peers.remove(&peer);
-                if let Some(specs) = self.awaiting_holepunch.remove(&peer) {
-                    for (service, _bind) in &specs {
-                        tracing::error!(
-                            peer = %peer,
-                            service = %service,
-                            "tunnel request dropped: all connections to peer lost"
-                        );
-                    }
+                self.dialing.remove(&peer);
+
+                if self.pending_retry_redial.remove(&peer) {
+                    self.dialing.insert(peer);
+                    commands.push(Command::DialPeer { peer });
+                    tracing::info!(%peer, "redialing peer for hole-punch retry");
+                } else if self.awaiting_holepunch.contains_key(&peer) {
+                    tracing::debug!(
+                        %peer,
+                        "all connections lost while waiting for direct path; awaiting next reconnect event"
+                    );
+                } else {
+                    self.clear_retry_state(&peer);
                 }
             }
 
@@ -472,7 +530,7 @@ mod tests {
         }
 
         #[test]
-        fn hole_punch_failed_keeps_waiting_tunnels(
+        fn hole_punch_failed_triggers_disconnect_retry(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -485,9 +543,11 @@ mod tests {
                 remote_peer: peer, reason,
             });
 
-            let _ = (service, bind);
-            prop_assert!(commands.is_empty());
+            let has_disconnect = commands.contains(&Command::DisconnectPeer { peer });
+            prop_assert!(has_disconnect);
             prop_assert!(state.awaiting_holepunch.contains_key(&peer));
+            prop_assert!(state.pending_retry_redial.contains(&peer));
+            prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(1));
         }
 
         #[test]
@@ -569,7 +629,7 @@ mod tests {
         }
 
         #[test]
-        fn holepunch_failed_keeps_waiting_tunnels(
+        fn holepunch_failed_then_connection_lost_redials(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -579,17 +639,50 @@ mod tests {
             state.awaiting_holepunch
                 .insert(peer, vec![(service.clone(), bind.clone())]);
 
+            let (state, fail_cmds) = state.transition(Event::HolePunchFailed {
+                remote_peer: peer,
+                reason,
+            });
+            let has_disconnect = fail_cmds.contains(&Command::DisconnectPeer { peer });
+            prop_assert!(has_disconnect);
+
+            let (state, reconnect_cmds) = state.transition(Event::ConnectionLost {
+                peer,
+                remaining_connections: 0,
+            });
+
+            let has_redial = reconnect_cmds.contains(&Command::DialPeer { peer });
+            prop_assert!(has_redial);
+            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
+            prop_assert!(!state.pending_retry_redial.contains(&peer));
+            prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(1));
+        }
+
+        #[test]
+        fn holepunch_failed_exhausted_budget_does_not_retry(
+            peer in arb_peer_id(),
+            service in arb_service_name(),
+            bind in arb_service_addr(),
+            reason in "[a-z ]{1,20}",
+        ) {
+            let mut state = TunnelState::new();
+            state.awaiting_holepunch
+                .insert(peer, vec![(service, bind)]);
+            state
+                .holepunch_retry_attempts
+                .insert(peer, MAX_HOLEPUNCH_RETRIES);
+
             let (state, commands) = state.transition(Event::HolePunchFailed {
                 remote_peer: peer,
                 reason,
             });
 
             prop_assert!(commands.is_empty());
-            let waiting = state
-                .awaiting_holepunch
-                .get(&peer)
-                .expect("peer remains queued after hole punch failure");
-            prop_assert!(waiting.contains(&(service, bind)));
+            prop_assert!(!state.pending_retry_redial.contains(&peer));
+            prop_assert_eq!(
+                state.holepunch_retry_attempts.get(&peer).copied(),
+                Some(MAX_HOLEPUNCH_RETRIES)
+            );
         }
 
         #[test]
@@ -604,12 +697,14 @@ mod tests {
 
             let (state, commands) = state.transition(Event::HolePunchTimeout { peer });
 
-            prop_assert!(commands.is_empty());
+            let has_disconnect = commands.contains(&Command::DisconnectPeer { peer });
+            prop_assert!(has_disconnect);
             let waiting = state
                 .awaiting_holepunch
                 .get(&peer)
                 .expect("peer remains queued after hole punch timeout");
             prop_assert!(waiting.contains(&(service, bind)));
+            prop_assert!(state.pending_retry_redial.contains(&peer));
         }
 
         #[test]
@@ -657,7 +752,7 @@ mod tests {
         }
 
         #[test]
-        fn connection_lost_cleans_tracking_state(
+        fn connection_lost_preserves_waiting_tunnels_without_retry_signal(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -673,13 +768,15 @@ mod tests {
 
             prop_assert!(commands.is_empty());
             prop_assert!(!state.relayed_peers.contains(&peer));
-            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
         }
 
         #[test]
         fn direct_connection_clears_relayed_after_retry(peer in arb_peer_id()) {
             let mut state = TunnelState::new();
             state.relayed_peers.insert(peer);
+            state.holepunch_retry_attempts.insert(peer, 2);
+            state.pending_retry_redial.insert(peer);
 
             let (state, _) = state.transition(Event::TunnelPeerConnected {
                 peer,
@@ -687,6 +784,8 @@ mod tests {
             });
 
             prop_assert!(!state.relayed_peers.contains(&peer));
+            prop_assert!(!state.pending_retry_redial.contains(&peer));
+            prop_assert!(!state.holepunch_retry_attempts.contains_key(&peer));
         }
 
         // ─── Symmetric NAT gating tests ────────────────────────────────

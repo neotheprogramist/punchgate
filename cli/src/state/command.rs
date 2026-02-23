@@ -34,6 +34,9 @@ pub enum Command {
     DialPeer {
         peer: PeerId,
     },
+    DisconnectPeer {
+        peer: PeerId,
+    },
     SpawnTunnel {
         peer: PeerId,
         service: ServiceName,

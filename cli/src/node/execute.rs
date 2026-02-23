@@ -94,6 +94,10 @@ pub fn execute_commands(
                 Ok(()) => tracing::info!(%peer, "dialing tunnel target"),
                 Err(e) => tracing::error!(%peer, error = %e, "failed to dial tunnel target"),
             },
+            Command::DisconnectPeer { peer } => match swarm.disconnect_peer_id(*peer) {
+                Ok(()) => tracing::info!(%peer, "disconnecting peer for hole-punch retry"),
+                Err(()) => tracing::debug!(%peer, "disconnect skipped: peer not connected"),
+            },
             Command::SpawnTunnel {
                 peer,
                 service,
