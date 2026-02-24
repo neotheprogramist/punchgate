@@ -53,7 +53,9 @@ const ADDRESS_CANDIDATE_TTL: Duration = Duration::from_secs(45);
 const MAX_DIRECT_CANDIDATES: usize = 8;
 const MAX_RELAY_CANDIDATES: usize = 4;
 const MAX_REDIAL_ADDRESSES: usize = 12;
-const MAX_RELAY_RECONNECT_RETRIES: u32 = 2;
+// Keep retries bounded, but allow one additional reconnect cycle to improve
+// direct-upgrade success when external UDP mappings churn mid-attempt.
+const MAX_RELAY_RECONNECT_RETRIES: u32 = 3;
 
 impl Default for TunnelState {
     fn default() -> Self {
@@ -1319,13 +1321,27 @@ mod tests {
             peer,
             attempt_id: 3,
         });
+        assert!(third_retry.contains(&Command::DisconnectPeer { peer }));
+        let (state, _) = state.transition(Event::ConnectionLost {
+            peer,
+            remaining_connections: 0,
+        });
 
-        assert!(third_retry.contains(&Command::SpawnTunnel {
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 4,
+        });
+        let (state, fourth_retry) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 4,
+        });
+
+        assert!(fourth_retry.contains(&Command::SpawnTunnel {
             peer,
             service,
             bind,
         }));
-        assert!(!third_retry.contains(&Command::DisconnectPeer { peer }));
+        assert!(!fourth_retry.contains(&Command::DisconnectPeer { peer }));
         assert!(!state.awaiting_holepunch.contains_key(&peer));
         assert!(!state.pending_retry_redial.contains(&peer));
         assert!(!state.holepunch_retry_attempts.contains_key(&peer));

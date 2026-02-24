@@ -42,7 +42,9 @@ use crate::{
 
 // ─── Main entry ─────────────────────────────────────────────────────────────
 
-const HOLE_PUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+// DCUtR's multi-attempt QUIC upgrade can exceed 15s in real NATs.
+// Keep retries attempt-scoped, but give each attempt enough time to complete.
+const HOLE_PUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct NodeConfig {
     pub identity_path: PathBuf,

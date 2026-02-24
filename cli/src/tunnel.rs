@@ -196,16 +196,14 @@ pub async fn connect_tunnel(
         let (tcp_stream, client_addr) = listener.accept().await?;
         tracing::debug!(%client_addr, "new tunnel client");
 
-        if !direct_peers.is_direct(&remote_peer).await {
-            tracing::warn!(
-                %remote_peer,
-                %client_addr,
-                service = %service_name,
-                "direct connection unavailable, rejecting tunnel client"
-            );
-            drop(tcp_stream);
-            continue;
-        }
+        let direct_path_ready = direct_peers.is_direct(&remote_peer).await;
+        tracing::debug!(
+            %remote_peer,
+            %client_addr,
+            service = %service_name,
+            path = if direct_path_ready { "direct" } else { "relay" },
+            "opening tunnel stream"
+        );
 
         let service_name = service_name.clone();
         let mut stream = control
