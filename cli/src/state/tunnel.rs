@@ -378,6 +378,16 @@ impl TunnelState {
             .copied()
             .unwrap_or(0);
         if retries_so_far >= MAX_RELAY_RECONNECT_RETRIES {
+            let fallback_specs = self.awaiting_holepunch.remove(&peer).unwrap_or_default();
+            let fallback_tunnels = fallback_specs.len();
+            commands.extend(fallback_specs.into_iter().map(|(service, bind)| {
+                Command::SpawnTunnel {
+                    peer,
+                    service,
+                    bind,
+                }
+            }));
+            self.clear_retry_state(&peer);
             tracing::warn!(
                 %peer,
                 attempt_id,
@@ -385,8 +395,9 @@ impl TunnelState {
                 %reason,
                 relay_snapshot = ?relay_snapshot,
                 direct_snapshot = ?direct_snapshot,
-                retry_policy = "bounded reconnect; retain relay",
-                "hole punch retries exhausted; keeping relayed path active"
+                fallback_tunnels,
+                retry_policy = "bounded reconnect; retain relay and fallback",
+                "hole punch retries exhausted; falling back to relayed tunnel path"
             );
             return;
         }
@@ -1239,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn retries_stop_reconnecting_and_keep_relay_after_limit() {
+    fn retries_exhausted_fall_back_to_relay_tunnel() {
         let peer = PeerId::random();
         let service = ServiceName::new("svc");
         let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
@@ -1286,9 +1297,16 @@ mod tests {
             attempt_id: 3,
         });
 
-        assert!(third_retry.is_empty());
+        assert!(third_retry.contains(&Command::SpawnTunnel {
+            peer,
+            service,
+            bind,
+        }));
+        assert!(!third_retry.contains(&Command::DisconnectPeer { peer }));
+        assert!(!state.awaiting_holepunch.contains_key(&peer));
         assert!(!state.pending_retry_redial.contains(&peer));
-        assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(2));
+        assert!(!state.holepunch_retry_attempts.contains_key(&peer));
+        assert!(!state.holepunch_sessions.contains_key(&peer));
     }
 
     #[test]
