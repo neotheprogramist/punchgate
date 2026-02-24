@@ -2,6 +2,11 @@
 name = "cli"
 version.workspace = true
 edition.workspace = true
+autobins = false
+
+[[bin]]
+name = "punchgate"
+path = "src/bin/cli.rs"
 
 [features]
 default = ["autonat"]

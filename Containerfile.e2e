@@ -1,4 +1,4 @@
-ARG APP_NAME=cli
+ARG APP_NAME=punchgate
 ARG FEATURES=
 
 FROM rust:1.93.1-alpine3.21 AS base

@@ -9,7 +9,8 @@ A peer-to-peer NAT-traversing tunnel mesh built on [libp2p](https://libp2p.io/).
 ### Prerequisites
 
 - Rust 1.85+ (edition 2024)
-- Two terminal windows (foreground mode)
+- `launchd` (macOS) or `systemd` (Linux) for background service mode
+- Two terminal windows (if you want foreground/manual runs)
 
 ### Build
 
@@ -24,18 +25,39 @@ cargo build --features mdns
 cargo build --features autonat
 ```
 
-### Background Service Mode (macOS, Ubuntu, Fedora)
+### Install + Service Mode (macOS + Linux, WireGuard-like UX)
 
-Punchgate can run in the background with a WireGuard-like UX:
+The most ergonomic deployment is:
+
+1. Install a stable `punchgate` binary path.
+2. Use `punchgate up/down/status/logs` to manage a per-user service.
+
+Build and install:
 
 ```bash
-# Install/update and start background service
+# Install from this repo (installs `punchgate` into ~/.cargo/bin)
+cargo install --path cli --locked
+
+# Upgrade to latest local source
+cargo install --path cli --locked --force
+```
+
+Ensure Cargo bin directory is on `PATH`:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Service lifecycle (same UX on both macOS and Linux):
+
+```bash
+# Install/update config + start service
 punchgate up [--identity ... --listen ... --bootstrap ... --expose ... --tunnel ... --tunnel-by-name ...]
 
-# Show service status
+# Inspect service state
 punchgate status
 
-# Show service logs
+# Read logs
 punchgate logs
 punchgate logs --follow
 
@@ -43,18 +65,29 @@ punchgate logs --follow
 punchgate down
 ```
 
-If you are running from source without installing the binary, use:
-`cargo run -p cli -- <command>` (for example, `cargo run -p cli -- up`).
-
 What `punchgate up` does:
 
-1. Writes runtime env config to `~/.config/punchgate/punchgate.env`
-2. Generates per-user service unit files:
-   `~/Library/LaunchAgents/com.punchgate.daemon.plist` (macOS) or
-   `~/.config/systemd/user/punchgate.service` (Linux)
+1. Writes runtime config to `~/.config/punchgate/punchgate.env`
+2. Generates per-user service file:
+   - macOS: `~/Library/LaunchAgents/com.punchgate.daemon.plist`
+   - Linux: `~/.config/systemd/user/punchgate.service`
 3. Starts/enables the service (`launchd` on macOS, `systemd --user` on Linux)
 
-Reference templates are also checked into the repo:
+Useful operational notes:
+
+- Linux: to keep the user service running across logout/reboot, enable linger once:
+  `sudo loginctl enable-linger "$USER"`
+- macOS logs are written to:
+  - `~/Library/Logs/punchgate.log`
+  - `~/Library/Logs/punchgate.err.log`
+- Linux logs are in journald (`journalctl --user -u punchgate.service`)
+- Built-in service commands currently target macOS (`launchd`) and Linux (`systemd`).
+  For other Unix variants, use the templates in `deploy/` with your local service manager.
+
+For development only, you can invoke service commands via Cargo:
+`cargo run -p cli -- <up|down|status|logs>`.
+
+Reference templates (for manual/system-wide setups) are in:
 
 - `deploy/launchd/com.punchgate.daemon.plist`
 - `deploy/systemd/punchgate.service`
@@ -170,7 +203,7 @@ cargo run -p cli -- \
   --expose ssh=127.0.0.1:22
 ```
 
-Any peer with `--bootstrap` is automatically treated as behind NAT: it requests a relay circuit and publishes the `ssh` service to the DHT. The relay is used only to coordinate DCUtR; tunnel activation is deferred until a direct (non-relayed) connection is established.
+Any peer with `--bootstrap` is automatically treated as behind NAT: it requests a relay circuit and publishes the `ssh` service to the DHT. Punchgate prefers a direct DCUtR-upgraded path, but falls back to relay transport when direct upgrade retries are exhausted.
 
 **Node 3 — Client (tunnel to workhorse's SSH by name):**
 
@@ -188,7 +221,7 @@ The client discovers the `ssh` provider via the Kademlia DHT — no need to know
 ssh -p 2222 user@127.0.0.1
 ```
 
-The data path: `ssh → TCP:2222 → Client → DCUtR direct path → Workhorse → TCP:22 → sshd`.
+The data path: `ssh → TCP:2222 → Client → [direct DCUtR path preferred, relay fallback] → Workhorse → TCP:22 → sshd`.
 
 ## Production Deployment
 
@@ -233,7 +266,7 @@ All other nodes need this peer ID and the bootstrap's public IP to join the mesh
 
 ### Non-Bootstrap Peer (Behind NAT)
 
-Peers behind NAT do not publish any ports. They connect outbound to bootstrap and reserve relay circuits for coordination, but tunnel traffic is permitted only on direct DCUtR-upgraded connections.
+Peers behind NAT do not publish any ports. They connect outbound to bootstrap and reserve relay circuits for coordination. Tunnel traffic prefers direct DCUtR-upgraded paths and can fall back to relay when direct upgrade does not succeed.
 
 Create the env file:
 
