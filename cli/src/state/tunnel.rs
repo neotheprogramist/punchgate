@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
@@ -21,6 +24,7 @@ pub struct TunnelState {
     pending_retry_redial: HashSet<PeerId>,
     holepunch_sessions: HashMap<PeerId, HolePunchSession>,
     address_oracle: HashMap<PeerId, PeerAddressOracle>,
+    address_last_seen: HashMap<PeerId, HashMap<Multiaddr, Instant>>,
     nat_mapping: NatMapping,
 }
 
@@ -45,6 +49,11 @@ struct PeerAddressOracle {
     direct_addrs: Vec<Multiaddr>,
 }
 
+const ADDRESS_CANDIDATE_TTL: Duration = Duration::from_secs(45);
+const MAX_DIRECT_CANDIDATES: usize = 8;
+const MAX_RELAY_CANDIDATES: usize = 4;
+const MAX_REDIAL_ADDRESSES: usize = 12;
+
 impl Default for TunnelState {
     fn default() -> Self {
         Self::new()
@@ -63,6 +72,7 @@ impl TunnelState {
             pending_retry_redial: HashSet::new(),
             holepunch_sessions: HashMap::new(),
             address_oracle: HashMap::new(),
+            address_last_seen: HashMap::new(),
             nat_mapping: NatMapping::Unknown,
         }
     }
@@ -144,17 +154,93 @@ impl TunnelState {
         *attempts
     }
 
-    fn update_address_oracle(&mut self, peer: PeerId, listen_addrs: Vec<Multiaddr>) {
-        let relay_addrs = dedup_addrs(
-            listen_addrs
-                .iter()
-                .filter(|addr| has_p2p_circuit(addr))
-                .cloned(),
+    fn record_address_candidates(
+        &mut self,
+        peer: PeerId,
+        listen_addrs: &[Multiaddr],
+        now: Instant,
+    ) {
+        let should_prune_entry = {
+            let last_seen = self.address_last_seen.entry(peer).or_default();
+            for addr in listen_addrs {
+                if has_p2p_circuit(addr) || is_supported_direct_candidate(addr) {
+                    last_seen.insert(addr.clone(), now);
+                }
+            }
+            last_seen.retain(|_, seen_at| {
+                now.saturating_duration_since(*seen_at) <= ADDRESS_CANDIDATE_TTL
+            });
+            last_seen.is_empty()
+        };
+        if should_prune_entry {
+            self.address_last_seen.remove(&peer);
+        }
+    }
+
+    fn fresh_candidates(
+        &self,
+        peer: &PeerId,
+        now: Instant,
+        predicate: impl Fn(&Multiaddr) -> bool,
+        limit: usize,
+    ) -> Vec<Multiaddr> {
+        let Some(last_seen) = self.address_last_seen.get(peer) else {
+            return Vec::new();
+        };
+        let mut ranked: Vec<(Multiaddr, Instant)> = last_seen
+            .iter()
+            .filter_map(|(addr, seen_at)| {
+                (now.saturating_duration_since(*seen_at) <= ADDRESS_CANDIDATE_TTL
+                    && predicate(addr))
+                .then_some((addr.clone(), *seen_at))
+            })
+            .collect();
+        ranked.sort_by(|(a_addr, a_seen), (b_addr, b_seen)| {
+            b_seen
+                .cmp(a_seen)
+                .then_with(|| a_addr.to_string().cmp(&b_addr.to_string()))
+        });
+        ranked.truncate(limit);
+        ranked.into_iter().map(|(addr, _)| addr).collect()
+    }
+
+    fn prioritized_redial_addrs(
+        &self,
+        peer: &PeerId,
+        session: &HolePunchSession,
+    ) -> Vec<Multiaddr> {
+        let now = Instant::now();
+        let oracle = self.address_oracle.get(peer).cloned().unwrap_or_default();
+        let fresh_direct = self.fresh_candidates(
+            peer,
+            now,
+            is_supported_direct_candidate,
+            MAX_DIRECT_CANDIDATES,
         );
-        let direct_addrs = dedup_addrs(
-            listen_addrs
-                .into_iter()
-                .filter(is_supported_direct_candidate),
+        let fresh_relay = self.fresh_candidates(peer, now, has_p2p_circuit, MAX_RELAY_CANDIDATES);
+
+        let mut addrs = Vec::new();
+        // Try most likely direct paths first, then fall back to relay paths.
+        addrs.extend(session.direct_snapshot.iter().cloned());
+        addrs.extend(oracle.direct_addrs);
+        addrs.extend(fresh_direct);
+        addrs.extend(session.relay_redial_addrs.iter().cloned());
+        addrs.extend(oracle.relay_addrs);
+        addrs.extend(fresh_relay);
+        let mut addrs = dedup_addrs(addrs);
+        addrs.truncate(MAX_REDIAL_ADDRESSES);
+        addrs
+    }
+
+    fn update_address_oracle(&mut self, peer: PeerId, listen_addrs: Vec<Multiaddr>) {
+        let now = Instant::now();
+        self.record_address_candidates(peer, &listen_addrs, now);
+        let relay_addrs = self.fresh_candidates(&peer, now, has_p2p_circuit, MAX_RELAY_CANDIDATES);
+        let direct_addrs = self.fresh_candidates(
+            &peer,
+            now,
+            is_supported_direct_candidate,
+            MAX_DIRECT_CANDIDATES,
         );
         let previous = self.address_oracle.get(&peer).cloned();
         let relay_changed = previous
@@ -172,14 +258,18 @@ impl TunnelState {
             );
         }
         if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
-            // Keep per-attempt snapshots stable once populated, but backfill empty snapshots
-            // when Identify arrives after the relayed connection.
             let backfilled_relay = session.relay_redial_addrs.is_empty() && !relay_addrs.is_empty();
             let backfilled_direct = session.direct_snapshot.is_empty() && !direct_addrs.is_empty();
-            if session.relay_redial_addrs.is_empty() {
+            let refreshed_relay = !session.relay_redial_addrs.is_empty()
+                && !relay_addrs.is_empty()
+                && session.relay_redial_addrs != relay_addrs;
+            let refreshed_direct = !session.direct_snapshot.is_empty()
+                && !direct_addrs.is_empty()
+                && session.direct_snapshot != direct_addrs;
+            if backfilled_relay || refreshed_relay {
                 session.relay_redial_addrs = relay_addrs.clone();
             }
-            if session.direct_snapshot.is_empty() {
+            if backfilled_direct || refreshed_direct {
                 session.direct_snapshot = direct_addrs.clone();
             }
             if backfilled_relay || backfilled_direct {
@@ -192,15 +282,16 @@ impl TunnelState {
                     direct_snapshot = ?session.direct_snapshot,
                     "hole-punch attempt snapshots backfilled from identify"
                 );
-            } else if relay_changed || direct_changed {
-                tracing::debug!(
+            } else if refreshed_relay || refreshed_direct {
+                tracing::info!(
                     %peer,
                     attempt_id = session.attempt_id,
+                    phase = ?session.phase,
+                    refreshed_relay,
+                    refreshed_direct,
                     relay_snapshot = ?session.relay_redial_addrs,
                     direct_snapshot = ?session.direct_snapshot,
-                    oracle_relay = ?relay_addrs,
-                    oracle_direct = ?direct_addrs,
-                    "hole-punch oracle changed while attempt snapshot stayed pinned"
+                    "hole-punch attempt snapshots refreshed from newer identify data"
                 );
             }
         }
@@ -469,15 +560,19 @@ impl MealyMachine for TunnelState {
 
                 if self.pending_retry_redial.remove(&peer) {
                     self.dialing.insert(peer);
-                    let command = match self.holepunch_sessions.get_mut(&peer) {
+                    let session_snapshot = self.holepunch_sessions.get(&peer).cloned();
+                    if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
+                        session.phase = HolePunchPhase::WaitingRedial;
+                    }
+                    let command = match session_snapshot {
                         Some(session) => {
-                            session.phase = HolePunchPhase::WaitingRedial;
-                            if session.relay_redial_addrs.is_empty() {
+                            let addrs = self.prioritized_redial_addrs(&peer, &session);
+                            if addrs.is_empty() {
                                 Command::DialPeer { peer }
                             } else {
                                 Command::DialPeerWithAddrs {
                                     peer,
-                                    addrs: session.relay_redial_addrs.clone(),
+                                    addrs,
                                     attempt_id: session.attempt_id,
                                 }
                             }
@@ -1158,5 +1253,54 @@ mod tests {
             addrs: vec![relay_addr],
             attempt_id: 3,
         }));
+    }
+
+    #[test]
+    fn retry_redial_prioritizes_direct_before_relay_candidates() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let relay_addr: Multiaddr = format!(
+            "/ip4/81.219.135.164/udp/4001/quic-v1/p2p/12D3KooWD8ZvJvEZ2aEXxonzcrbtgBw8ZK7NfuVLrHvX2dJQs6W3/p2p-circuit/p2p/{peer}"
+        )
+        .parse()
+        .expect("valid relay multiaddr");
+        let direct_addr: Multiaddr = format!("/ip4/81.219.135.162/udp/41613/quic-v1/p2p/{peer}")
+            .parse()
+            .expect("valid direct multiaddr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![relay_addr.clone(), direct_addr.clone()],
+            observed_addr: relay_addr.clone(),
+        });
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 1,
+        });
+        let (state, _) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 1,
+        });
+        let (_, commands) = state.transition(Event::ConnectionLost {
+            peer,
+            remaining_connections: 0,
+        });
+
+        let addrs = commands
+            .iter()
+            .find_map(|command| match command {
+                Command::DialPeerWithAddrs {
+                    peer: dial_peer,
+                    addrs,
+                    attempt_id,
+                } if *dial_peer == peer && *attempt_id == 1 => Some(addrs),
+                _ => None,
+            })
+            .expect("expected redial with explicit addresses");
+        assert_eq!(addrs.first(), Some(&direct_addr));
+        assert!(addrs.contains(&relay_addr));
     }
 }

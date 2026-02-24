@@ -116,14 +116,14 @@ pub fn execute_commands(
                         %peer,
                         attempt_id,
                         addrs = ?addrs,
-                        "dialing tunnel target with relay snapshot addresses"
+                        "dialing tunnel target with prioritized hole-punch addresses"
                     ),
                     Err(e) => tracing::error!(
                         %peer,
                         attempt_id,
                         addrs = ?addrs,
                         error = %e,
-                        "failed to dial tunnel target with relay snapshot addresses"
+                        "failed to dial tunnel target with prioritized hole-punch addresses"
                     ),
                 }
             }
