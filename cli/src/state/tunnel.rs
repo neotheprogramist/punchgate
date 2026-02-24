@@ -251,7 +251,7 @@ impl TunnelState {
             .as_ref()
             .is_none_or(|oracle| oracle.direct_addrs != direct_addrs);
         if relay_changed || direct_changed {
-            tracing::info!(
+            tracing::debug!(
                 %peer,
                 relay_addrs = ?relay_addrs,
                 direct_addrs = ?direct_addrs,
@@ -274,7 +274,7 @@ impl TunnelState {
                 session.direct_snapshot = direct_addrs.clone();
             }
             if backfilled_relay || backfilled_direct {
-                tracing::info!(
+                tracing::debug!(
                     %peer,
                     attempt_id = session.attempt_id,
                     backfilled_relay,
@@ -284,7 +284,7 @@ impl TunnelState {
                     "hole-punch attempt snapshots backfilled from identify"
                 );
             } else if refreshed_relay || refreshed_direct {
-                tracing::info!(
+                tracing::debug!(
                     %peer,
                     attempt_id = session.attempt_id,
                     phase = ?session.phase,
@@ -307,7 +307,7 @@ impl TunnelState {
 
     fn begin_holepunch_attempt(&mut self, peer: PeerId, attempt_id: u64) {
         let oracle = self.address_oracle.get(&peer).cloned().unwrap_or_default();
-        tracing::info!(
+        tracing::debug!(
             %peer,
             attempt_id,
             relay_snapshot = ?oracle.relay_addrs,
@@ -397,7 +397,7 @@ impl TunnelState {
                 direct_snapshot = ?direct_snapshot,
                 fallback_tunnels,
                 retry_policy = "bounded reconnect; retain relay and fallback",
-                "hole punch retries exhausted; falling back to relayed tunnel path"
+                "hole punch did not succeed; continuing with relayed tunnel path"
             );
             return;
         }
@@ -610,11 +610,18 @@ impl MealyMachine for TunnelState {
                         None => Command::DialPeer { peer },
                     };
                     commands.push(command);
-                    tracing::info!(%peer, "redialing peer for hole-punch retry");
-                } else if self.awaiting_holepunch.contains_key(&peer) {
-                    tracing::debug!(
+                    tracing::debug!(%peer, "redialing peer for hole-punch retry");
+                } else if let Some(waiting_specs) = self.awaiting_holepunch.remove(&peer) {
+                    self.clear_retry_state(&peer);
+                    self.pending_by_peer
+                        .entry(peer)
+                        .or_default()
+                        .extend(waiting_specs);
+                    self.dialing.insert(peer);
+                    commands.push(Command::DialPeer { peer });
+                    tracing::info!(
                         %peer,
-                        "all connections lost while waiting for direct path; awaiting next reconnect event"
+                        "all connections lost while waiting for direct path; redialing peer"
                     );
                 } else {
                     self.clear_retry_state(&peer);
@@ -981,7 +988,7 @@ mod tests {
         }
 
         #[test]
-        fn holepunch_failed_legacy_then_connection_lost_does_not_redial(
+        fn holepunch_failed_legacy_then_connection_lost_recovers_with_redial(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
@@ -1002,8 +1009,16 @@ mod tests {
                 remaining_connections: 0,
             });
 
-            prop_assert!(reconnect_cmds.is_empty());
-            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
+            let has_redial = reconnect_cmds
+                .iter()
+                .any(|c| matches!(c, Command::DialPeer { peer: p } if *p == peer));
+            prop_assert!(has_redial);
+            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+            let pending = state
+                .pending_by_peer
+                .get(&peer)
+                .expect("peer should be requeued for redial");
+            prop_assert!(pending.contains(&(service, bind)));
             prop_assert!(!state.pending_retry_redial.contains(&peer));
             prop_assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), None);
         }
@@ -1101,23 +1116,31 @@ mod tests {
         }
 
         #[test]
-        fn connection_lost_preserves_waiting_tunnels_without_retry_signal(
+        fn connection_lost_requeues_waiting_tunnels_and_redials(
             peer in arb_peer_id(),
             service in arb_service_name(),
             bind in arb_service_addr(),
         ) {
             let mut state = TunnelState::new();
             state.relayed_peers.insert(peer);
-            state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+            state.awaiting_holepunch.insert(peer, vec![(service.clone(), bind.clone())]);
 
             let (state, commands) = state.transition(Event::ConnectionLost {
                 peer,
                 remaining_connections: 0,
             });
 
-            prop_assert!(commands.is_empty());
+            let has_redial = commands
+                .iter()
+                .any(|c| matches!(c, Command::DialPeer { peer: p } if *p == peer));
+            prop_assert!(has_redial);
             prop_assert!(!state.relayed_peers.contains(&peer));
-            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
+            prop_assert!(!state.awaiting_holepunch.contains_key(&peer));
+            let pending = state
+                .pending_by_peer
+                .get(&peer)
+                .expect("peer should be requeued for redial");
+            prop_assert!(pending.contains(&(service, bind)));
         }
 
         #[test]

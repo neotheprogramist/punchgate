@@ -69,7 +69,7 @@ pub fn translate_swarm_event(
         SwarmEvent::ListenerClosed {
             reason, addresses, ..
         } => {
-            tracing::info!(reason = ?reason, "listener closed");
+            tracing::debug!(reason = ?reason, "listener closed");
             if reason.is_err()
                 && let Some(relay_peer) = extract_relay_peer_from_addrs(addresses)
             {
@@ -220,7 +220,7 @@ fn translate_behaviour_event(
 
         BehaviourEvent::Dcutr(event) => match &event.result {
             Ok(connection_id) => {
-                tracing::info!(
+                tracing::debug!(
                     peer = %event.remote_peer_id,
                     connection_id = ?connection_id,
                     "dcutr upgraded relayed path to direct connection"
@@ -230,7 +230,7 @@ fn translate_behaviour_event(
                 }]
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     peer = %event.remote_peer_id,
                     error = %e,
                     "dcutr reported hole-punch failure (raw event; attempt-scoped retry logic is authoritative)"
