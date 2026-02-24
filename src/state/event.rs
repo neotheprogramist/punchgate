@@ -57,11 +57,14 @@ pub enum Event {
     },
     DhtServiceResolved {
         service_name: ServiceName,
-        provider: PeerId,
-        connected: bool,
+        providers: Vec<(PeerId, bool)>,
     },
     DhtServiceFailed {
         service_name: ServiceName,
+        reason: String,
+    },
+    TunnelDialFailed {
+        peer: PeerId,
         reason: String,
     },
     TunnelPeerConnected {
@@ -72,19 +75,9 @@ pub enum Event {
         peer: PeerId,
         attempt_id: u64,
     },
-    HolePunchSucceeded {
-        remote_peer: PeerId,
-    },
     HolePunchFailed {
         remote_peer: PeerId,
         reason: String,
-    },
-    HolePunchTimeout {
-        peer: PeerId,
-    },
-    HolePunchAttemptSucceeded {
-        remote_peer: PeerId,
-        attempt_id: u64,
     },
     HolePunchAttemptFailed {
         remote_peer: PeerId,

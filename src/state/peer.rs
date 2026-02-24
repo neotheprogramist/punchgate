@@ -236,16 +236,14 @@ impl MealyMachine for PeerState {
                 commands.extend(self.maybe_request_relay());
             }
 
-            Event::HolePunchSucceeded { .. }
-            | Event::HolePunchFailed { .. }
-            | Event::HolePunchTimeout { .. }
+            Event::HolePunchFailed { .. }
             | Event::HolePunchAttemptStarted { .. }
-            | Event::HolePunchAttemptSucceeded { .. }
             | Event::HolePunchAttemptFailed { .. }
             | Event::HolePunchAttemptTimeout { .. }
             | Event::DhtPeerLookupComplete { .. }
             | Event::DhtServiceResolved { .. }
             | Event::DhtServiceFailed { .. }
+            | Event::TunnelDialFailed { .. }
             | Event::TunnelPeerConnected { .. }
             | Event::PhaseChanged { .. } => {}
 
@@ -278,7 +276,9 @@ impl MealyMachine for PeerState {
             } => {
                 if remaining_connections == 0 {
                     self.known_peers.remove(&peer);
-                    self.relay_reserved = false;
+                    if self.bootstrap_peers.contains(&peer) {
+                        self.relay_reserved = false;
+                    }
                     match (
                         self.phase,
                         self.known_peers.is_empty(),
@@ -798,31 +798,26 @@ mod tests {
             state.phase = phase;
             state.nat_status = nat_status;
 
-            let (s1, c1) = state.clone().transition(Event::HolePunchSucceeded { remote_peer: peer });
+            let (s1, c1) = state.clone().transition(Event::HolePunchFailed {
+                remote_peer: peer, reason: reason.clone(),
+            });
             prop_assert_eq!(s1.phase, phase);
             prop_assert_eq!(s1.nat_status, nat_status);
             prop_assert!(c1.is_empty());
 
-            let (s2, c2) = state.clone().transition(Event::HolePunchFailed {
-                remote_peer: peer, reason: reason.clone(),
+            let (s2, c2) = state.clone().transition(Event::DhtPeerLookupComplete {
+                peer, connected: true,
             });
             prop_assert_eq!(s2.phase, phase);
             prop_assert_eq!(s2.nat_status, nat_status);
             prop_assert!(c2.is_empty());
 
-            let (s3, c3) = state.clone().transition(Event::DhtPeerLookupComplete {
-                peer, connected: true,
+            let (s3, c3) = state.clone().transition(Event::TunnelPeerConnected {
+                peer, relayed: false,
             });
             prop_assert_eq!(s3.phase, phase);
             prop_assert_eq!(s3.nat_status, nat_status);
             prop_assert!(c3.is_empty());
-
-            let (s4, c4) = state.clone().transition(Event::TunnelPeerConnected {
-                peer, relayed: false,
-            });
-            prop_assert_eq!(s4.phase, phase);
-            prop_assert_eq!(s4.nat_status, nat_status);
-            prop_assert!(c4.is_empty());
         }
 
         #[test]
@@ -916,7 +911,7 @@ mod tests {
         }
 
         #[test]
-        fn connection_lost_resets_relay_reserved(
+        fn connection_lost_bootstrap_resets_relay_reserved(
             peer in arb_peer_id(),
             addr in arb_multiaddr(),
             other_peer in arb_peer_id(),
@@ -927,6 +922,7 @@ mod tests {
             let mut state = PeerState::new();
             state.phase = Phase::Ready;
             state.relay_reserved = true;
+            state.bootstrap_peers.insert(peer);
             state.known_peers.entry(peer).or_default().insert(addr);
             state.known_peers.entry(other_peer).or_default().insert(other_addr);
 
@@ -936,6 +932,35 @@ mod tests {
             });
 
             prop_assert!(!state.relay_reserved);
+            prop_assert_eq!(state.phase, Phase::Ready);
+        }
+
+        #[test]
+        fn connection_lost_non_bootstrap_keeps_relay_reserved(
+            peer in arb_peer_id(),
+            addr in arb_multiaddr(),
+            bootstrap_peer in arb_peer_id(),
+            bootstrap_addr in arb_multiaddr(),
+        ) {
+            prop_assume!(peer != bootstrap_peer);
+
+            let mut state = PeerState::new();
+            state.phase = Phase::Ready;
+            state.relay_reserved = true;
+            state.bootstrap_peers.insert(bootstrap_peer);
+            state.known_peers.entry(peer).or_default().insert(addr);
+            state
+                .known_peers
+                .entry(bootstrap_peer)
+                .or_default()
+                .insert(bootstrap_addr);
+
+            let (state, _) = state.transition(Event::ConnectionLost {
+                peer,
+                remaining_connections: 0,
+            });
+
+            prop_assert!(state.relay_reserved);
             prop_assert_eq!(state.phase, Phase::Ready);
         }
     }

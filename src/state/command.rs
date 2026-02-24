@@ -8,8 +8,6 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     // ─── Network (from PeerState) ───────────────────────────────────────────
-    Dial(Multiaddr),
-    Listen(Multiaddr),
     KademliaBootstrap,
     KademliaAddAddress {
         peer: PeerId,
@@ -19,7 +17,6 @@ pub enum Command {
         relay_peer: PeerId,
         relay_addr: Multiaddr,
     },
-    AddExternalAddress(Multiaddr),
     Shutdown,
 
     // ─── Tunnel (from TunnelState) ──────────────────────────────────────────

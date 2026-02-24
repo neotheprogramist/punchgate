@@ -95,6 +95,15 @@ pub fn translate_swarm_event(
             } else {
                 tracing::debug!(peer = ?peer_id, error = %error, "outgoing connection error");
             }
+            if let Some(peer) = peer_id
+                && !bootstrap_peers.contains(peer)
+                && !err_msg.contains("local peer id")
+            {
+                events.push(Event::TunnelDialFailed {
+                    peer: *peer,
+                    reason: err_msg,
+                });
+            }
         }
 
         SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -225,9 +234,7 @@ fn translate_behaviour_event(
                     connection_id = ?connection_id,
                     "dcutr upgraded relayed path to direct connection"
                 );
-                vec![Event::HolePunchSucceeded {
-                    remote_peer: event.remote_peer_id,
-                }]
+                vec![]
             }
             Err(e) => {
                 tracing::debug!(
@@ -262,15 +269,29 @@ fn translate_get_providers(
 ) -> Vec<Event> {
     match result {
         Ok(kad::GetProvidersOk::FoundProviders { providers, .. }) => {
-            match providers.iter().next() {
-                Some(provider) => match kad_service_queries.remove(&id) {
-                    Some(service_name) => vec![Event::DhtServiceResolved {
-                        service_name,
-                        provider: *provider,
-                        connected: is_connected(provider),
-                    }],
-                    None => vec![],
-                },
+            match kad_service_queries.remove(&id) {
+                Some(service_name) => {
+                    let mut provider_candidates: Vec<(PeerId, bool)> = providers
+                        .iter()
+                        .map(|provider| (*provider, is_connected(provider)))
+                        .collect();
+                    provider_candidates.sort_by(|(a_peer, a_connected), (b_peer, b_connected)| {
+                        b_connected
+                            .cmp(a_connected)
+                            .then_with(|| a_peer.to_string().cmp(&b_peer.to_string()))
+                    });
+                    if provider_candidates.is_empty() {
+                        vec![Event::DhtServiceFailed {
+                            service_name,
+                            reason: "no providers found".to_string(),
+                        }]
+                    } else {
+                        vec![Event::DhtServiceResolved {
+                            service_name,
+                            providers: provider_candidates,
+                        }]
+                    }
+                }
                 None => vec![],
             }
         }

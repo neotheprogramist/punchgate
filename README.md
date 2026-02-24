@@ -33,7 +33,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 Use service commands instead of long-running foreground terminals:
 
 ```bash
-punchgate up [--identity ... --listen ... --bootstrap ... --expose ... --tunnel ... --tunnel-by-name ...]
+punchgate [--identity ... --listen ... --bootstrap ... --expose ... --tunnel ... --tunnel-by-name ...] up
 punchgate status
 punchgate logs
 punchgate logs --follow
@@ -45,6 +45,24 @@ punchgate down
 - macOS: `~/Library/LaunchAgents/com.punchgate.daemon.plist`
 - Linux: `~/.config/systemd/user/punchgate.service`
 - Env file: `~/.config/punchgate/punchgate.env`
+
+Service-mode configuration example (provider):
+
+```bash
+punchgate \
+  --bootstrap /ip4/<BOOTSTRAP_IP>/udp/4001/quic-v1/p2p/<BOOTSTRAP_ID> \
+  --expose workhorse-ssh=127.0.0.1:22 \
+  up
+```
+
+Service-mode configuration example (client):
+
+```bash
+punchgate \
+  --bootstrap /ip4/<BOOTSTRAP_IP>/udp/4001/quic-v1/p2p/<BOOTSTRAP_ID> \
+  --tunnel-by-name workhorse-ssh@127.0.0.1:2222 \
+  up
+```
 
 Linux keep-alive across logout:
 
@@ -82,8 +100,9 @@ Verify:
 ssh -p 2222 user@127.0.0.1
 ```
 
-Punchgate prefers direct DCUtR paths and falls back to relay when direct
-upgrade retries are exhausted.
+Punchgate prefers direct DCUtR paths, retries direct-upgrade attempts with
+fresh address candidates when possible, and falls back to relay when retries
+are exhausted.
 
 ## Logging
 

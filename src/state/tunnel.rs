@@ -17,7 +17,7 @@ use crate::{
 pub struct TunnelState {
     pending_by_peer: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
     pending_by_service: HashMap<ServiceName, Vec<ServiceAddr>>,
-    dialing: HashSet<PeerId>,
+    service_provider_candidates: HashMap<ServiceName, Vec<PeerId>>,
     awaiting_holepunch: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>>,
     relayed_peers: HashSet<PeerId>,
     holepunch_retry_attempts: HashMap<PeerId, u32>,
@@ -68,7 +68,7 @@ impl TunnelState {
         Self {
             pending_by_peer: HashMap::new(),
             pending_by_service: HashMap::new(),
-            dialing: HashSet::new(),
+            service_provider_candidates: HashMap::new(),
             awaiting_holepunch: HashMap::new(),
             relayed_peers: HashSet::new(),
             holepunch_retry_attempts: HashMap::new(),
@@ -100,6 +100,74 @@ impl TunnelState {
 
     pub fn has_pending_for(&self, peer: &PeerId) -> bool {
         self.pending_by_peer.contains_key(peer)
+    }
+
+    fn store_provider_candidates(&mut self, service_name: &ServiceName, providers: Vec<PeerId>) {
+        let providers = dedup_peers(providers);
+        if providers.is_empty() {
+            self.service_provider_candidates.remove(service_name);
+        } else {
+            self.service_provider_candidates
+                .insert(service_name.clone(), providers);
+        }
+    }
+
+    fn next_fallback_provider(
+        &mut self,
+        service_name: &ServiceName,
+        exclude_peer: PeerId,
+    ) -> Option<PeerId> {
+        let providers = self.service_provider_candidates.get_mut(service_name)?;
+        while let Some(next_peer) = providers.first().copied() {
+            providers.remove(0);
+            if next_peer != exclude_peer {
+                if providers.is_empty() {
+                    self.service_provider_candidates.remove(service_name);
+                }
+                return Some(next_peer);
+            }
+        }
+        self.service_provider_candidates.remove(service_name);
+        None
+    }
+
+    fn reroute_specs_after_dial_failure(&mut self, peer: PeerId, commands: &mut Vec<Command>) {
+        let Some(specs) = self.pending_by_peer.remove(&peer) else {
+            return;
+        };
+
+        let mut reassign_to_peer: HashMap<PeerId, Vec<(ServiceName, ServiceAddr)>> = HashMap::new();
+        let mut refresh_services: HashSet<ServiceName> = HashSet::new();
+
+        for (service_name, bind_addr) in specs {
+            if let Some(next_peer) = self.next_fallback_provider(&service_name, peer) {
+                reassign_to_peer
+                    .entry(next_peer)
+                    .or_default()
+                    .push((service_name, bind_addr));
+            } else {
+                self.pending_by_service
+                    .entry(service_name.clone())
+                    .or_default()
+                    .push(bind_addr);
+                refresh_services.insert(service_name);
+            }
+        }
+
+        for (next_peer, next_specs) in reassign_to_peer {
+            self.pending_by_peer
+                .entry(next_peer)
+                .or_default()
+                .extend(next_specs);
+            commands.push(Command::DhtLookupPeer { peer: next_peer });
+        }
+
+        for service_name in refresh_services {
+            commands.push(Command::DhtGetProviders {
+                key: KademliaKey::for_service(&service_name),
+                service_name,
+            });
+        }
     }
 
     fn initiate_lookups(&self) -> Vec<Command> {
@@ -451,7 +519,6 @@ impl MealyMachine for TunnelState {
                 }
                 false => {
                     if self.pending_by_peer.contains_key(&peer) {
-                        self.dialing.insert(peer);
                         commands.push(Command::DialPeer { peer });
                     }
                 }
@@ -459,32 +526,69 @@ impl MealyMachine for TunnelState {
 
             Event::DhtServiceResolved {
                 service_name,
-                provider,
-                connected,
+                providers,
             } => {
                 if let Some(bind_addrs) = self.pending_by_service.remove(&service_name) {
+                    if providers.is_empty() {
+                        self.pending_by_service
+                            .insert(service_name.clone(), bind_addrs);
+                        commands.push(Command::DhtGetProviders {
+                            key: KademliaKey::for_service(&service_name),
+                            service_name,
+                        });
+                        return (self, commands);
+                    }
+
+                    let mut providers = dedup_provider_candidates(providers);
+                    let (provider, connected) = providers.remove(0);
+                    let fallback_providers: Vec<PeerId> =
+                        providers.into_iter().map(|(peer, _)| peer).collect();
+                    self.store_provider_candidates(&service_name, fallback_providers);
+
                     let specs: Vec<(ServiceName, ServiceAddr)> = bind_addrs
                         .into_iter()
                         .map(|addr| (service_name.clone(), addr))
                         .collect();
 
-                    match connected {
-                        true => {
-                            commands.extend(self.route_connected_peer(provider, specs));
-                        }
-                        false => {
-                            self.pending_by_peer
-                                .entry(provider)
-                                .or_default()
-                                .extend(specs);
-                            commands.push(Command::DhtLookupPeer { peer: provider });
-                        }
+                    if connected {
+                        commands.extend(self.route_connected_peer(provider, specs));
+                    } else {
+                        self.pending_by_peer
+                            .entry(provider)
+                            .or_default()
+                            .extend(specs);
+                        commands.push(Command::DhtLookupPeer { peer: provider });
                     }
                 }
             }
 
             Event::DhtServiceFailed { service_name, .. } => {
-                self.pending_by_service.remove(&service_name);
+                if self.pending_by_service.contains_key(&service_name) {
+                    commands.push(Command::DhtGetProviders {
+                        key: KademliaKey::for_service(&service_name),
+                        service_name,
+                    });
+                }
+            }
+
+            Event::TunnelDialFailed { peer, reason } => {
+                tracing::warn!(%peer, %reason, "tunnel dial failed");
+                if self.awaiting_holepunch.contains_key(&peer)
+                    && let Some(session) = self.holepunch_sessions.get(&peer).cloned()
+                {
+                    let addrs = self.prioritized_redial_addrs(&peer, &session);
+                    if addrs.is_empty() {
+                        commands.push(Command::DialPeer { peer });
+                    } else {
+                        commands.push(Command::DialPeerWithAddrs {
+                            peer,
+                            addrs,
+                            attempt_id: session.attempt_id,
+                        });
+                    }
+                } else {
+                    self.reroute_specs_after_dial_failure(peer, &mut commands);
+                }
             }
 
             Event::PeerIdentified {
@@ -493,81 +597,47 @@ impl MealyMachine for TunnelState {
                 self.update_address_oracle(peer, listen_addrs);
             }
 
-            Event::TunnelPeerConnected { peer, relayed } => {
-                self.dialing.remove(&peer);
-                match relayed {
-                    true => {
-                        self.relayed_peers.insert(peer);
+            Event::TunnelPeerConnected { peer, relayed } => match relayed {
+                true => {
+                    self.relayed_peers.insert(peer);
 
-                        if let Some(specs) = self.pending_by_peer.remove(&peer) {
-                            if !self.nat_mapping.is_holepunch_viable() {
-                                tracing::warn!(
-                                    peer = %peer,
-                                    nat = %self.nat_mapping,
-                                    "direct tunnel blocked: relayed-only connection and hole punching not viable"
-                                );
-                            }
-                            self.queue_for_direct(peer, specs);
+                    if let Some(specs) = self.pending_by_peer.remove(&peer) {
+                        if !self.nat_mapping.is_holepunch_viable() {
+                            tracing::warn!(
+                                peer = %peer,
+                                nat = %self.nat_mapping,
+                                "direct tunnel blocked: relayed-only connection and hole punching not viable"
+                            );
                         }
-                    }
-                    false => {
-                        self.relayed_peers.remove(&peer);
-                        self.clear_retry_state(&peer);
-                        commands.extend(
-                            self.pending_by_peer
-                                .remove(&peer)
-                                .into_iter()
-                                .chain(self.awaiting_holepunch.remove(&peer))
-                                .flatten()
-                                .map(|(service, bind)| Command::SpawnTunnel {
-                                    peer,
-                                    service,
-                                    bind,
-                                }),
-                        );
+                        self.queue_for_direct(peer, specs);
                     }
                 }
-            }
+                false => {
+                    self.relayed_peers.remove(&peer);
+                    self.clear_retry_state(&peer);
+                    commands.extend(
+                        self.pending_by_peer
+                            .remove(&peer)
+                            .into_iter()
+                            .chain(self.awaiting_holepunch.remove(&peer))
+                            .flatten()
+                            .map(|(service, bind)| Command::SpawnTunnel {
+                                peer,
+                                service,
+                                bind,
+                            }),
+                    );
+                }
+            },
 
             Event::HolePunchAttemptStarted { peer, attempt_id } => {
                 self.begin_holepunch_attempt(peer, attempt_id);
             }
 
-            Event::HolePunchSucceeded { .. } => {}
-
-            Event::HolePunchAttemptSucceeded {
-                remote_peer,
-                attempt_id,
-            } => match self.holepunch_sessions.get(&remote_peer) {
-                Some(session) if session.attempt_id == attempt_id => {}
-                Some(session) => {
-                    tracing::debug!(
-                        peer = %remote_peer,
-                        expected_attempt = session.attempt_id,
-                        received_attempt = attempt_id,
-                        "ignoring stale hole-punch success"
-                    );
-                }
-                None => {
-                    tracing::debug!(
-                        peer = %remote_peer,
-                        attempt_id,
-                        "ignoring hole-punch success without active attempt"
-                    );
-                }
-            },
-
             Event::HolePunchFailed { remote_peer, .. } => {
                 tracing::debug!(
                     peer = %remote_peer,
                     "ignoring legacy hole-punch failure event"
-                );
-            }
-
-            Event::HolePunchTimeout { peer } => {
-                tracing::debug!(
-                    peer = %peer,
-                    "ignoring legacy hole-punch timeout event"
                 );
             }
 
@@ -588,10 +658,8 @@ impl MealyMachine for TunnelState {
                 remaining_connections: 0,
             } => {
                 self.relayed_peers.remove(&peer);
-                self.dialing.remove(&peer);
 
                 if self.pending_retry_redial.remove(&peer) {
-                    self.dialing.insert(peer);
                     let session_snapshot = self.holepunch_sessions.get(&peer).cloned();
                     if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
                         session.phase = HolePunchPhase::WaitingRedial;
@@ -619,7 +687,6 @@ impl MealyMachine for TunnelState {
                         .entry(peer)
                         .or_default()
                         .extend(waiting_specs);
-                    self.dialing.insert(peer);
                     commands.push(Command::DialPeer { peer });
                     tracing::info!(
                         %peer,
@@ -657,6 +724,30 @@ fn dedup_addrs(addrs: impl IntoIterator<Item = Multiaddr>) -> Vec<Multiaddr> {
         .into_iter()
         .filter(|addr| seen.insert(addr.clone()))
         .collect()
+}
+
+fn dedup_peers(peers: impl IntoIterator<Item = PeerId>) -> Vec<PeerId> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for peer in peers {
+        if seen.insert(peer) {
+            deduped.push(peer);
+        }
+    }
+    deduped
+}
+
+fn dedup_provider_candidates(
+    providers: impl IntoIterator<Item = (PeerId, bool)>,
+) -> Vec<(PeerId, bool)> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for (peer, connected) in providers {
+        if seen.insert(peer) {
+            deduped.push((peer, connected));
+        }
+    }
+    deduped
 }
 
 fn has_p2p_circuit(addr: &Multiaddr) -> bool {
@@ -791,7 +882,6 @@ mod tests {
 
             let has_dial = commands.contains(&Command::DialPeer { peer });
             prop_assert!(has_dial);
-            prop_assert!(state.dialing.contains(&peer));
             prop_assert!(state.has_pending_for(&peer));
         }
 
@@ -806,8 +896,7 @@ mod tests {
 
             let (_, commands) = state.transition(Event::DhtServiceResolved {
                 service_name: service.clone(),
-                provider,
-                connected: true,
+                providers: vec![(provider, true)],
             });
 
             let has_spawn = commands.contains(&Command::SpawnTunnel {
@@ -827,8 +916,7 @@ mod tests {
 
             let (state, commands) = state.transition(Event::DhtServiceResolved {
                 service_name: service,
-                provider,
-                connected: false,
+                providers: vec![(provider, false)],
             });
 
             let has_lookup = commands.contains(&Command::DhtLookupPeer { peer: provider });
@@ -869,24 +957,6 @@ mod tests {
                 peer, relayed: true,
             });
 
-            prop_assert!(commands.is_empty());
-            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
-        }
-
-        #[test]
-        fn hole_punch_succeeded_keeps_waiting_tunnels(
-            peer in arb_peer_id(),
-            service in arb_service_name(),
-            bind in arb_service_addr(),
-        ) {
-            let mut state = TunnelState::new();
-            state.awaiting_holepunch.insert(peer, vec![(service.clone(), bind.clone())]);
-
-            let (state, commands) = state.transition(Event::HolePunchSucceeded {
-                remote_peer: peer,
-            });
-
-            let _ = (service, bind);
             prop_assert!(commands.is_empty());
             prop_assert!(state.awaiting_holepunch.contains_key(&peer));
         }
@@ -977,8 +1047,7 @@ mod tests {
 
             let (state, commands) = state.transition(Event::DhtServiceResolved {
                 service_name: service.clone(),
-                provider,
-                connected: true,
+                providers: vec![(provider, true)],
             });
 
             prop_assert!(commands.is_empty());
@@ -1050,46 +1119,6 @@ mod tests {
                 state.holepunch_retry_attempts.get(&peer).copied(),
                 Some(1_000)
             );
-        }
-
-        #[test]
-        fn holepunch_timeout_legacy_event_is_noop(
-            peer in arb_peer_id(),
-            service in arb_service_name(),
-            bind in arb_service_addr(),
-        ) {
-            let mut state = TunnelState::new();
-            state.awaiting_holepunch
-                .insert(peer, vec![(service.clone(), bind.clone())]);
-
-            let (state, commands) = state.transition(Event::HolePunchTimeout { peer });
-
-            prop_assert!(commands.is_empty());
-            let waiting = state
-                .awaiting_holepunch
-                .get(&peer)
-                .expect("peer remains queued after hole punch timeout");
-            prop_assert!(waiting.contains(&(service, bind)));
-            prop_assert!(!state.pending_retry_redial.contains(&peer));
-        }
-
-        #[test]
-        fn holepunch_succeeded_waits_for_direct_connection(
-            peer in arb_peer_id(),
-            service in arb_service_name(),
-            bind in arb_service_addr(),
-        ) {
-            let mut state = TunnelState::new();
-            state.relayed_peers.insert(peer);
-            state.awaiting_holepunch
-                .insert(peer, vec![(service.clone(), bind.clone())]);
-
-            let (state, commands) = state.transition(Event::HolePunchSucceeded {
-                remote_peer: peer,
-            });
-
-            prop_assert!(commands.is_empty());
-            prop_assert!(state.awaiting_holepunch.contains_key(&peer));
         }
 
         #[test]
@@ -1272,6 +1301,121 @@ mod tests {
 
         assert!(commands.contains(&Command::DisconnectPeer { peer }));
         assert!(state.pending_retry_redial.contains(&peer));
+    }
+
+    #[test]
+    fn dht_service_failed_retries_lookup_when_intent_is_pending() {
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let mut state = TunnelState::new();
+        state.add_service_tunnel(service.clone(), bind);
+
+        let (_, commands) = state.transition(Event::DhtServiceFailed {
+            service_name: service.clone(),
+            reason: "timeout".to_string(),
+        });
+
+        assert!(commands.contains(&Command::DhtGetProviders {
+            service_name: service.clone(),
+            key: KademliaKey::for_service(&service),
+        }));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_reroutes_to_fallback_provider() {
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let primary = PeerId::random();
+        let fallback = PeerId::random();
+        assert_ne!(primary, fallback);
+
+        let mut state = TunnelState::new();
+        state.add_service_tunnel(service.clone(), bind.clone());
+
+        let (state, first_commands) = state.transition(Event::DhtServiceResolved {
+            service_name: service.clone(),
+            providers: vec![(primary, false), (fallback, false)],
+        });
+        assert!(first_commands.contains(&Command::DhtLookupPeer { peer: primary }));
+        assert!(state.has_pending_for(&primary));
+
+        let (state, fail_commands) = state.transition(Event::TunnelDialFailed {
+            peer: primary,
+            reason: "dial refused".to_string(),
+        });
+        assert!(fail_commands.contains(&Command::DhtLookupPeer { peer: fallback }));
+        assert!(!state.has_pending_for(&primary));
+        assert!(state.has_pending_for(&fallback));
+        let pending = state
+            .pending_by_peer
+            .get(&fallback)
+            .expect("fallback provider should receive pending tunnel spec");
+        assert!(pending.contains(&(service, bind)));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_requeries_service_when_no_fallback_provider() {
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let primary = PeerId::random();
+
+        let mut state = TunnelState::new();
+        state.add_service_tunnel(service.clone(), bind.clone());
+
+        let (state, first_commands) = state.transition(Event::DhtServiceResolved {
+            service_name: service.clone(),
+            providers: vec![(primary, false)],
+        });
+        assert!(first_commands.contains(&Command::DhtLookupPeer { peer: primary }));
+        assert!(state.has_pending_for(&primary));
+
+        let (state, fail_commands) = state.transition(Event::TunnelDialFailed {
+            peer: primary,
+            reason: "timeout".to_string(),
+        });
+        assert!(!state.has_pending_for(&primary));
+        assert!(fail_commands.contains(&Command::DhtGetProviders {
+            service_name: service.clone(),
+            key: KademliaKey::for_service(&service),
+        }));
+        let pending_binds = state
+            .pending_by_service
+            .get(&service)
+            .expect("service tunnel intent should be preserved for retry");
+        assert_eq!(pending_binds.as_slice(), &[bind]);
+    }
+
+    #[test]
+    fn tunnel_dial_failed_during_holepunch_redials_with_attempt_addresses() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let direct_addr: Multiaddr = "/ip4/81.219.135.162/udp/47207/quic-v1"
+            .parse()
+            .expect("valid direct address");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 9,
+        });
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![direct_addr.clone()],
+            observed_addr: direct_addr.clone(),
+        });
+
+        let (_, commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+
+        assert!(commands.contains(&Command::DialPeerWithAddrs {
+            peer,
+            addrs: vec![direct_addr],
+            attempt_id: 9,
+        }));
     }
 
     #[test]

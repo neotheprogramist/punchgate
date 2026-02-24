@@ -30,14 +30,6 @@ pub fn execute_commands(
 ) {
     for cmd in commands {
         match cmd {
-            Command::Dial(addr) => match swarm.dial(addr.clone()) {
-                Ok(()) => {}
-                Err(e) => tracing::warn!(%addr, error = %e, "dial failed"),
-            },
-            Command::Listen(addr) => match swarm.listen_on(addr.clone()) {
-                Ok(_) => {}
-                Err(e) => tracing::warn!(%addr, error = %e, "listen failed"),
-            },
             Command::KademliaBootstrap => match swarm.behaviour_mut().kademlia.bootstrap() {
                 Ok(query_id) => ctx.active_bootstrap_query = Some(query_id),
                 Err(e) => {
@@ -69,9 +61,6 @@ pub fn execute_commands(
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "relay reservation listen failed"),
                 }
-            }
-            Command::AddExternalAddress(addr) => {
-                swarm.add_external_address(addr.clone());
             }
             Command::PublishServices => {
                 publish_services(swarm, exposed);

@@ -526,28 +526,23 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 let mut events = synthetic_events;
                 events.extend(translated_events);
 
-                for state_event in events {
-                    match &state_event {
-                        Event::HolePunchSucceeded { remote_peer } => {
-                            tracing::debug!(
-                                peer = %remote_peer,
-                                "ignoring raw DCUtR success event; direct connection events are authoritative"
-                            );
-                            continue;
-                        }
-                        Event::HolePunchFailed {
-                            remote_peer,
-                            reason,
-                        } => {
+                for mut state_event in events {
+                    if let Event::HolePunchFailed { remote_peer, reason } = &state_event {
+                        if let Some(stats) = connection_state.active_attempt_stats(remote_peer) {
+                            state_event = Event::HolePunchAttemptFailed {
+                                remote_peer: *remote_peer,
+                                attempt_id: stats.attempt_id,
+                                reason: reason.clone(),
+                            };
+                        } else {
                             tracing::warn!(
                                 peer = %remote_peer,
                                 %reason,
                                 nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
-                                "hole punch failed (DCUtR reported error)"
+                                "hole punch failed (DCUtR reported error without active attempt)"
                             );
                             continue;
                         }
-                        _ => {}
                     }
 
                     // Bootstrap server: confirm observed addresses from Identify
@@ -692,13 +687,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         }
                         Event::DhtServiceResolved {
                             service_name,
-                            provider,
-                            connected,
+                            providers,
                         } => {
                             tracing::info!(
                                 %service_name,
-                                provider = %provider,
-                                connected,
+                                provider_count = providers.len(),
+                                providers = ?providers,
                                 "DHT provider resolved service"
                             );
                         }
@@ -731,49 +725,15 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                 "tunnel peer connected state updated"
                             );
                         }
+                        Event::TunnelDialFailed { peer, reason } => {
+                            tracing::debug!(
+                                peer = %peer,
+                                %reason,
+                                "tunnel dial failed event received"
+                            );
+                        }
                         Event::RelayReservationAccepted { relay_peer } => {
                             tracing::info!(%relay_peer, "relay reservation accepted");
-                        }
-                        Event::HolePunchAttemptSucceeded {
-                            remote_peer,
-                            attempt_id,
-                        } => {
-                            let known_addrs = known_addrs_for_peer(&app_state, remote_peer);
-                            if let Some(stats) = connection_state.active_attempt_stats(remote_peer)
-                                && stats.attempt_id != *attempt_id
-                            {
-                                tracing::debug!(
-                                    peer = %remote_peer,
-                                    expected_attempt = stats.attempt_id,
-                                    received_attempt = attempt_id,
-                                    "ignoring stale hole-punch success event"
-                                );
-                                continue;
-                            }
-
-                            if let Some(stats) = connection_state.complete_hole_punch_attempt(remote_peer) {
-                                tracing::info!(
-                                    peer = %remote_peer,
-                                    attempt_id,
-                                    elapsed_ms = stats.elapsed_ms(),
-                                    dials_started = stats.dials_started,
-                                    dial_failures = stats.dials_failed,
-                                    last_dial_error = ?stats.last_dial_error,
-                                    direct_connections = connection_state.direct_connection_count(remote_peer),
-                                    relayed_connections = connection_state.relayed_connection_count(remote_peer),
-                                    known_addrs = ?known_addrs,
-                                    "hole punch succeeded; direct connection established"
-                                );
-                            } else {
-                                tracing::info!(
-                                    peer = %remote_peer,
-                                    attempt_id,
-                                    direct_connections = connection_state.direct_connection_count(remote_peer),
-                                    relayed_connections = connection_state.relayed_connection_count(remote_peer),
-                                    known_addrs = ?known_addrs,
-                                    "hole punch succeeded; direct connection established"
-                                );
-                            }
                         }
                         Event::HolePunchAttemptFailed {
                             remote_peer,
