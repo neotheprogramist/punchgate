@@ -9,7 +9,7 @@ A peer-to-peer NAT-traversing tunnel mesh built on [libp2p](https://libp2p.io/).
 ### Prerequisites
 
 - Rust 1.85+ (edition 2024)
-- Two terminal windows
+- Two terminal windows (foreground mode)
 
 ### Build
 
@@ -23,6 +23,41 @@ cargo build --features mdns
 # With AutoNAT for dynamic NAT detection
 cargo build --features autonat
 ```
+
+### Background Service Mode (macOS, Ubuntu, Fedora)
+
+Punchgate can run in the background with a WireGuard-like UX:
+
+```bash
+# Install/update and start background service
+punchgate up [--identity ... --listen ... --bootstrap ... --expose ... --tunnel ... --tunnel-by-name ...]
+
+# Show service status
+punchgate status
+
+# Show service logs
+punchgate logs
+punchgate logs --follow
+
+# Stop and disable service
+punchgate down
+```
+
+If you are running from source without installing the binary, use:
+`cargo run -p cli -- <command>` (for example, `cargo run -p cli -- up`).
+
+What `punchgate up` does:
+
+1. Writes runtime env config to `~/.config/punchgate/punchgate.env`
+2. Generates per-user service unit files:
+   `~/Library/LaunchAgents/com.punchgate.daemon.plist` (macOS) or
+   `~/.config/systemd/user/punchgate.service` (Linux)
+3. Starts/enables the service (`launchd` on macOS, `systemd --user` on Linux)
+
+Reference templates are also checked into the repo:
+
+- `deploy/launchd/com.punchgate.daemon.plist`
+- `deploy/systemd/punchgate.service`
 
 ### Run the Tests
 
@@ -239,7 +274,7 @@ The connection upgrade path:
 
 1. **Relay** — NATed peers reserve a relay circuit through bootstrap on connect
 2. **DCUtR hole punch** — both peers attempt simultaneous QUIC connections to punch through their NATs
-3. **Direct-only tunnel activation** — tunnels start only after a non-relayed connection is confirmed; there is no relay fallback for tunnel data
+3. **Direct-preferred tunnel activation** — tunnels prefer direct non-relayed connectivity; if hole-punch retries are exhausted, tunnel setup falls back to the relayed path
 
 For dynamic NAT detection, enable the `autonat` feature at build time.
 
@@ -307,6 +342,8 @@ cargo run -p cli -- \
   --listen /ip4/0.0.0.0/udp/0/quic-v1 \
   2> logs/my-peer.log
 ```
+
+For clean capture, use either `cargo run --release 2>&1 | tee run.log` or just `cargo run --release | tee run.log`.
 
 Use `RUST_LOG` to control verbosity:
 
