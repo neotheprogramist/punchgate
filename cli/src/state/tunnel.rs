@@ -53,6 +53,7 @@ const ADDRESS_CANDIDATE_TTL: Duration = Duration::from_secs(45);
 const MAX_DIRECT_CANDIDATES: usize = 8;
 const MAX_RELAY_CANDIDATES: usize = 4;
 const MAX_REDIAL_ADDRESSES: usize = 12;
+const MAX_RELAY_RECONNECT_RETRIES: u32 = 2;
 
 impl Default for TunnelState {
     fn default() -> Self {
@@ -371,6 +372,24 @@ impl TunnelState {
         }
         let relay_snapshot = session.relay_redial_addrs.clone();
         let direct_snapshot = session.direct_snapshot.clone();
+        let retries_so_far = self
+            .holepunch_retry_attempts
+            .get(&peer)
+            .copied()
+            .unwrap_or(0);
+        if retries_so_far >= MAX_RELAY_RECONNECT_RETRIES {
+            tracing::warn!(
+                %peer,
+                attempt_id,
+                retries_so_far,
+                %reason,
+                relay_snapshot = ?relay_snapshot,
+                direct_snapshot = ?direct_snapshot,
+                retry_policy = "bounded reconnect; retain relay",
+                "hole punch retries exhausted; keeping relayed path active"
+            );
+            return;
+        }
         let attempt = self.schedule_holepunch_retry(peer);
         if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
             session.phase = HolePunchPhase::WaitingDisconnect;
@@ -385,7 +404,7 @@ impl TunnelState {
             direct_snapshot = ?direct_snapshot,
             oracle_relay = ?oracle.relay_addrs,
             oracle_direct = ?oracle.direct_addrs,
-            retry_policy = "unbounded event-driven",
+            retry_policy = "bounded reconnect",
             "hole punch retry requested, reconnecting relayed path"
         );
         commands.push(Command::DisconnectPeer { peer });
@@ -1217,6 +1236,59 @@ mod tests {
 
         assert!(commands.contains(&Command::DisconnectPeer { peer }));
         assert!(state.pending_retry_redial.contains(&peer));
+    }
+
+    #[test]
+    fn retries_stop_reconnecting_and_keep_relay_after_limit() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+
+        let mut state = TunnelState::new();
+        state
+            .awaiting_holepunch
+            .insert(peer, vec![(service.clone(), bind.clone())]);
+
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 1,
+        });
+        let (state, first_retry) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 1,
+        });
+        assert!(first_retry.contains(&Command::DisconnectPeer { peer }));
+        let (state, _) = state.transition(Event::ConnectionLost {
+            peer,
+            remaining_connections: 0,
+        });
+
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 2,
+        });
+        let (state, second_retry) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 2,
+        });
+        assert!(second_retry.contains(&Command::DisconnectPeer { peer }));
+        let (state, _) = state.transition(Event::ConnectionLost {
+            peer,
+            remaining_connections: 0,
+        });
+
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 3,
+        });
+        let (state, third_retry) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 3,
+        });
+
+        assert!(third_retry.is_empty());
+        assert!(!state.pending_retry_redial.contains(&peer));
+        assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(2));
     }
 
     #[test]
