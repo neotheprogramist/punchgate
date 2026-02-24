@@ -233,7 +233,7 @@ fn translate_behaviour_event(
                 tracing::warn!(
                     peer = %event.remote_peer_id,
                     error = %e,
-                    "dcutr reported hole-punch failure"
+                    "dcutr reported hole-punch failure (raw event; attempt-scoped retry logic is authoritative)"
                 );
                 vec![Event::HolePunchFailed {
                     remote_peer: event.remote_peer_id,

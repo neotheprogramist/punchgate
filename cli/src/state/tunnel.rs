@@ -156,14 +156,52 @@ impl TunnelState {
                 .into_iter()
                 .filter(is_supported_direct_candidate),
         );
+        let previous = self.address_oracle.get(&peer).cloned();
+        let relay_changed = previous
+            .as_ref()
+            .is_none_or(|oracle| oracle.relay_addrs != relay_addrs);
+        let direct_changed = previous
+            .as_ref()
+            .is_none_or(|oracle| oracle.direct_addrs != direct_addrs);
+        if relay_changed || direct_changed {
+            tracing::info!(
+                %peer,
+                relay_addrs = ?relay_addrs,
+                direct_addrs = ?direct_addrs,
+                "hole-punch address oracle updated"
+            );
+        }
         if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
             // Keep per-attempt snapshots stable once populated, but backfill empty snapshots
             // when Identify arrives after the relayed connection.
+            let backfilled_relay = session.relay_redial_addrs.is_empty() && !relay_addrs.is_empty();
+            let backfilled_direct = session.direct_snapshot.is_empty() && !direct_addrs.is_empty();
             if session.relay_redial_addrs.is_empty() {
                 session.relay_redial_addrs = relay_addrs.clone();
             }
             if session.direct_snapshot.is_empty() {
                 session.direct_snapshot = direct_addrs.clone();
+            }
+            if backfilled_relay || backfilled_direct {
+                tracing::info!(
+                    %peer,
+                    attempt_id = session.attempt_id,
+                    backfilled_relay,
+                    backfilled_direct,
+                    relay_snapshot = ?session.relay_redial_addrs,
+                    direct_snapshot = ?session.direct_snapshot,
+                    "hole-punch attempt snapshots backfilled from identify"
+                );
+            } else if relay_changed || direct_changed {
+                tracing::debug!(
+                    %peer,
+                    attempt_id = session.attempt_id,
+                    relay_snapshot = ?session.relay_redial_addrs,
+                    direct_snapshot = ?session.direct_snapshot,
+                    oracle_relay = ?relay_addrs,
+                    oracle_direct = ?direct_addrs,
+                    "hole-punch oracle changed while attempt snapshot stayed pinned"
+                );
             }
         }
         self.address_oracle.insert(
@@ -177,6 +215,13 @@ impl TunnelState {
 
     fn begin_holepunch_attempt(&mut self, peer: PeerId, attempt_id: u64) {
         let oracle = self.address_oracle.get(&peer).cloned().unwrap_or_default();
+        tracing::info!(
+            %peer,
+            attempt_id,
+            relay_snapshot = ?oracle.relay_addrs,
+            direct_snapshot = ?oracle.direct_addrs,
+            "hole-punch attempt snapshots initialized"
+        );
         self.holepunch_sessions.insert(
             peer,
             HolePunchSession {
@@ -233,15 +278,22 @@ impl TunnelState {
             );
             return;
         }
+        let relay_snapshot = session.relay_redial_addrs.clone();
+        let direct_snapshot = session.direct_snapshot.clone();
         let attempt = self.schedule_holepunch_retry(peer);
         if let Some(session) = self.holepunch_sessions.get_mut(&peer) {
             session.phase = HolePunchPhase::WaitingDisconnect;
         }
+        let oracle = self.address_oracle.get(&peer).cloned().unwrap_or_default();
         tracing::warn!(
             %peer,
             attempt_id,
             attempt,
             %reason,
+            relay_snapshot = ?relay_snapshot,
+            direct_snapshot = ?direct_snapshot,
+            oracle_relay = ?oracle.relay_addrs,
+            oracle_direct = ?oracle.direct_addrs,
             retry_policy = "unbounded event-driven",
             "hole punch retry requested, reconnecting relayed path"
         );

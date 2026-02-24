@@ -420,6 +420,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             if stats.attempt_id == attempt_id {
                                 stats.dials_failed = stats.dials_failed.saturating_add(1);
                                 stats.last_dial_error = Some(error.to_string());
+                                let error_flags = hole_punch_error_flags(error);
                                 tracing::warn!(
                                     peer = %peer,
                                     attempt_id,
@@ -427,6 +428,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                                     attempt = stats.dials_started,
                                     failures = stats.dials_failed,
                                     error = %error,
+                                    has_handshake_timeout = error_flags.has_handshake_timeout,
+                                    has_unsupported_bare_p2p = error_flags.has_unsupported_bare_p2p,
+                                    has_pending_abort = error_flags.has_pending_abort,
                                     relayed_connections = connection_count_for_peer(&relayed_connections, &peer),
                                     direct_connections = connection_count_for_peer(&direct_connections, &peer),
                                     "hole-punch dial attempt failed"
@@ -647,6 +651,15 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             .filter(|addr| external_addr::has_public_ip(addr))
                             .cloned()
                             .collect();
+                        let mut direct_public_ports_by_ip: HashMap<IpAddr, HashSet<u16>> =
+                            HashMap::new();
+                        for (ip, port) in listen_addrs
+                            .iter()
+                            .filter(|addr| external_addr::is_valid_external_candidate(addr))
+                            .filter_map(external_addr::extract_public_ip_port)
+                        {
+                            direct_public_ports_by_ip.entry(ip).or_default().insert(port);
+                        }
                         tracing::info!(
                             peer = %peer,
                             observed_addr = %observed_addr,
@@ -655,6 +668,16 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             relayed_observation_ignored = peer_has_relayed_connection(&relayed_connections, peer),
                             "identify received"
                         );
+                        if direct_public_ports_by_ip
+                            .values()
+                            .any(|ports| ports.len() > 1)
+                        {
+                            tracing::warn!(
+                                peer = %peer,
+                                ports_by_ip = ?direct_public_ports_by_ip,
+                                "peer advertises multiple direct public ports; hole-punch candidates may be stale"
+                            );
+                        }
                     }
 
                     // NAT type detection: track external port observations per IP
@@ -1114,6 +1137,22 @@ fn log_phase_transition(old: Phase, new: Phase, commands: usize) {
                 "phase transition"
             );
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HolePunchErrorFlags {
+    has_handshake_timeout: bool,
+    has_unsupported_bare_p2p: bool,
+    has_pending_abort: bool,
+}
+
+fn hole_punch_error_flags(error: &impl std::fmt::Display) -> HolePunchErrorFlags {
+    let error_text = error.to_string();
+    HolePunchErrorFlags {
+        has_handshake_timeout: error_text.contains("Handshake with the remote timed out"),
+        has_unsupported_bare_p2p: error_text.contains("Multiaddr is not supported: /p2p/"),
+        has_pending_abort: error_text.contains("Pending connection attempt has been aborted"),
     }
 }
 
