@@ -7,8 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use cli::specs::{ExposedService, TunnelByNameSpec, TunnelSpec};
 use libp2p::Multiaddr;
+use punchgate::specs::{ExposedService, TunnelByNameSpec, TunnelSpec};
 use tracing_subscriber::EnvFilter;
 
 const SERVICE_LABEL: &str = "com.punchgate.daemon";
@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     }
 
     let cfg = RuntimeConfig::from(&cli);
-    cli::node::run(cli::node::NodeConfig {
+    punchgate::node::run(punchgate::node::NodeConfig {
         identity_path: cfg.identity_path,
         listen_addrs: cfg.listen_addrs,
         bootstrap_addrs: cfg.bootstrap_addrs,
@@ -295,9 +295,9 @@ fn run_linux_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
                 SYSTEMD_SERVICE_NAME,
             ]))?;
 
-            println!("installed: {}", service_path.display());
-            println!("env file: {}", env_path.display());
-            println!("service started: {SYSTEMD_SERVICE_NAME}");
+            tracing::info!(path = %service_path.display(), "installed service unit");
+            tracing::info!(path = %env_path.display(), "wrote runtime env file");
+            tracing::info!(service = SYSTEMD_SERVICE_NAME, "service started");
         }
         ServiceCommand::Down => {
             run_allow_failure(Command::new("systemctl").args([
@@ -307,7 +307,10 @@ fn run_linux_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
                 SYSTEMD_SERVICE_NAME,
             ]))?;
             run_allow_failure(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            println!("service stopped/disabled: {SYSTEMD_SERVICE_NAME}");
+            tracing::info!(
+                service = SYSTEMD_SERVICE_NAME,
+                "service stopped and disabled"
+            );
         }
         ServiceCommand::Status => {
             run_checked(Command::new("systemctl").args([
@@ -390,9 +393,9 @@ fn run_macos_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
             run_checked(Command::new("launchctl").args(["enable", &label_handle]))?;
             run_checked(Command::new("launchctl").args(["kickstart", "-k", &label_handle]))?;
 
-            println!("installed: {}", plist_path.display());
-            println!("env file: {}", env_path.display());
-            println!("service started: {SERVICE_LABEL}");
+            tracing::info!(path = %plist_path.display(), "installed launch agent");
+            tracing::info!(path = %env_path.display(), "wrote runtime env file");
+            tracing::info!(service = SERVICE_LABEL, "service started");
         }
         ServiceCommand::Down => {
             run_allow_failure(Command::new("launchctl").args([
@@ -401,7 +404,7 @@ fn run_macos_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
                 &plist_path_string(&plist_path),
             ]))?;
             run_allow_failure(Command::new("launchctl").args(["disable", &label_handle]))?;
-            println!("service stopped: {SERVICE_LABEL}");
+            tracing::info!(service = SERVICE_LABEL, "service stopped");
         }
         ServiceCommand::Status => {
             run_checked(Command::new("launchctl").args(["print", &label_handle]))?;

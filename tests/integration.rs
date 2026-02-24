@@ -24,7 +24,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
 
-            let kad_config = kad::Config::new(cli::protocol::kad_protocol());
+            let kad_config = kad::Config::new(punchgate::protocol::kad_protocol());
             let store = kad::store::MemoryStore::new(peer_id);
             let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
@@ -34,7 +34,7 @@ fn build_test_swarm() -> (libp2p::Swarm<TestBehaviour>, PeerId, libp2p_stream::C
                 .expect("create mDNS behaviour");
 
             let identify = identify::Behaviour::new(identify::Config::new(
-                cli::protocol::IDENTIFY_PROTOCOL.to_string(),
+                punchgate::protocol::IDENTIFY_PROTOCOL.to_string(),
                 key.public(),
             ));
 
@@ -75,7 +75,7 @@ fn build_test_swarm_with_keypair(
         .with_behaviour(|key| {
             let peer_id = PeerId::from(key.public());
 
-            let kad_config = kad::Config::new(cli::protocol::kad_protocol());
+            let kad_config = kad::Config::new(punchgate::protocol::kad_protocol());
             let store = kad::store::MemoryStore::new(peer_id);
             let mut kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
             kademlia.set_mode(Some(kad::Mode::Server));
@@ -85,7 +85,7 @@ fn build_test_swarm_with_keypair(
                 .expect("create mDNS behaviour");
 
             let identify = identify::Behaviour::new(identify::Config::new(
-                cli::protocol::IDENTIFY_PROTOCOL.to_string(),
+                punchgate::protocol::IDENTIFY_PROTOCOL.to_string(),
                 key.public(),
             ));
 
@@ -251,18 +251,19 @@ async fn service_discovery_tunnel() {
     });
 
     // Register tunnel accept on Peer B
-    let services: Arc<HashMap<cli::types::ServiceName, cli::specs::ServiceAddr>> = Arc::new(
-        [(
-            cli::types::ServiceName::new("echo"),
-            cli::specs::ServiceAddr::from(echo_addr),
-        )]
-        .into(),
-    );
+    let services: Arc<HashMap<punchgate::types::ServiceName, punchgate::specs::ServiceAddr>> =
+        Arc::new(
+            [(
+                punchgate::types::ServiceName::new("echo"),
+                punchgate::specs::ServiceAddr::from(echo_addr),
+            )]
+            .into(),
+        );
 
     let incoming_b = control_b
-        .accept(cli::protocol::tunnel_protocol())
+        .accept(punchgate::protocol::tunnel_protocol())
         .expect("register tunnel protocol");
-    tokio::spawn(cli::tunnel::accept_loop(incoming_b, services));
+    tokio::spawn(punchgate::tunnel::accept_loop(incoming_b, services));
 
     // Run Peer A (bootstrap) — must handle Identify to populate Kademlia routing table
     let handle_a = tokio::spawn(async move {
@@ -334,8 +335,9 @@ async fn service_discovery_tunnel() {
                     },
                 )) if connected_to_a => {
                     // Advertise "echo" service in DHT
-                    let key =
-                        cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
+                    let key = punchgate::types::KademliaKey::for_service(
+                        &punchgate::types::ServiceName::new("echo"),
+                    );
                     let record_key = kad::RecordKey::new(&key);
                     let _ = swarm_b.behaviour_mut().kademlia.start_providing(record_key);
                 }
@@ -398,8 +400,9 @@ async fn service_discovery_tunnel() {
                     },
                 )) if !queried_providers => {
                     queried_providers = true;
-                    let key =
-                        cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
+                    let key = punchgate::types::KademliaKey::for_service(
+                        &punchgate::types::ServiceName::new("echo"),
+                    );
                     let record_key = kad::RecordKey::new(&key);
                     swarm_c.behaviour_mut().kademlia.get_providers(record_key);
                 }
@@ -435,8 +438,9 @@ async fn service_discovery_tunnel() {
                         ..
                     },
                 )) if queried_providers && discovered_provider.is_none() => {
-                    let key =
-                        cli::types::KademliaKey::for_service(&cli::types::ServiceName::new("echo"));
+                    let key = punchgate::types::KademliaKey::for_service(
+                        &punchgate::types::ServiceName::new("echo"),
+                    );
                     let record_key = kad::RecordKey::new(&key);
                     swarm_c.behaviour_mut().kademlia.get_providers(record_key);
                 }
@@ -453,12 +457,12 @@ async fn service_discovery_tunnel() {
                 use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
                 let mut stream = control_c
-                    .open_stream(provider, cli::protocol::tunnel_protocol())
+                    .open_stream(provider, punchgate::protocol::tunnel_protocol())
                     .await
                     .expect("open tunnel stream to provider");
 
-                let req = serde_json::to_vec(&cli::tunnel::TunnelRequest {
-                    service_name: cli::types::ServiceName::new("echo"),
+                let req = serde_json::to_vec(&punchgate::tunnel::TunnelRequest {
+                    service_name: punchgate::types::ServiceName::new("echo"),
                 })
                 .expect("serialize tunnel request");
                 let len = u32::try_from(req.len())
@@ -480,7 +484,7 @@ async fn service_discovery_tunnel() {
                     .read_exact(&mut resp_buf)
                     .await
                     .expect("read response body");
-                let resp: cli::tunnel::TunnelResponse =
+                let resp: punchgate::tunnel::TunnelResponse =
                     serde_json::from_slice(&resp_buf).expect("deserialize tunnel response");
                 assert!(resp.accepted, "tunnel should be accepted");
 
@@ -567,18 +571,19 @@ async fn three_peer_tunnel() {
     });
 
     // Register tunnel accept on Peer B
-    let services: Arc<HashMap<cli::types::ServiceName, cli::specs::ServiceAddr>> = Arc::new(
-        [(
-            cli::types::ServiceName::new("echo"),
-            cli::specs::ServiceAddr::from(echo_addr),
-        )]
-        .into(),
-    );
+    let services: Arc<HashMap<punchgate::types::ServiceName, punchgate::specs::ServiceAddr>> =
+        Arc::new(
+            [(
+                punchgate::types::ServiceName::new("echo"),
+                punchgate::specs::ServiceAddr::from(echo_addr),
+            )]
+            .into(),
+        );
 
     let incoming_b = control_b
-        .accept(cli::protocol::tunnel_protocol())
+        .accept(punchgate::protocol::tunnel_protocol())
         .expect("register tunnel protocol");
-    tokio::spawn(cli::tunnel::accept_loop(incoming_b, services));
+    tokio::spawn(punchgate::tunnel::accept_loop(incoming_b, services));
 
     // Run Peer A
     let handle_a = tokio::spawn(async move {
@@ -666,14 +671,14 @@ async fn three_peer_tunnel() {
 
     // Now C opens a tunnel stream to B
     let mut stream = control_c
-        .open_stream(peer_b, cli::protocol::tunnel_protocol())
+        .open_stream(peer_b, punchgate::protocol::tunnel_protocol())
         .await
         .expect("open tunnel stream");
 
     // Send tunnel request (length-prefixed JSON)
     use futures::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let req = serde_json::to_vec(&cli::tunnel::TunnelRequest {
-        service_name: cli::types::ServiceName::new("echo"),
+    let req = serde_json::to_vec(&punchgate::tunnel::TunnelRequest {
+        service_name: punchgate::types::ServiceName::new("echo"),
     })
     .expect("serialize tunnel request");
     let len = u32::try_from(req.len())
@@ -697,7 +702,7 @@ async fn three_peer_tunnel() {
         .read_exact(&mut resp_buf)
         .await
         .expect("read response body");
-    let resp: cli::tunnel::TunnelResponse =
+    let resp: punchgate::tunnel::TunnelResponse =
         serde_json::from_slice(&resp_buf).expect("deserialize tunnel response");
     assert!(resp.accepted, "tunnel should be accepted");
 

@@ -408,7 +408,7 @@ impl TunnelState {
             session.phase = HolePunchPhase::WaitingDisconnect;
         }
         let oracle = self.address_oracle.get(&peer).cloned().unwrap_or_default();
-        tracing::warn!(
+        tracing::info!(
             %peer,
             attempt_id,
             attempt,

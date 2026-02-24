@@ -188,6 +188,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut observed_nat_ports: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
     let mut confirmed_external_by_ip: HashMap<IpAddr, Multiaddr> = HashMap::new();
     let mut bootstrap_observed_external_by_ip: HashMap<IpAddr, Multiaddr> = HashMap::new();
+    let mut announced_listen_addrs: HashSet<Multiaddr> = HashSet::new();
     let mut connection_state = ConnectionStateMachine::new();
     let mut port_mapping_handle: Option<
         tokio::task::JoinHandle<Option<crate::port_mapping::PortMapping>>,
@@ -204,7 +205,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         tokio::select! {
             event = swarm.select_next_some() => {
                 if let SwarmEvent::NewListenAddr { address, .. } = &event {
-                    tracing::info!("listening on {address}");
+                    if announced_listen_addrs.insert(address.clone()) {
+                        tracing::info!("listening on {address}");
+                    } else {
+                        tracing::debug!("ignoring duplicate listen address event: {address}");
+                    }
                 }
 
                 if let SwarmEvent::NewListenAddr { address, .. } = &event
@@ -229,6 +234,17 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         is_relayed,
                         HOLE_PUNCH_TIMEOUT,
                     );
+                    let relayed_connections = connection_state.relayed_connection_count(peer_id);
+                    let direct_connections = connection_state.direct_connection_count(peer_id);
+                    if relayed_connections + direct_connections == 1 {
+                        tracing::info!(
+                            peer = %peer_id,
+                            relayed = is_relayed,
+                            relayed_connections,
+                            direct_connections,
+                            "peer connected"
+                        );
+                    }
 
                     if let Some(attempt_id) = update.started_attempt_id {
                         synthetic_events.push(Event::HolePunchAttemptStarted {
@@ -247,16 +263,17 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     if update.direct_connection_established {
                         ctx.direct_peers.mark_direct(*peer_id).await;
                     }
-
                     if let Some(stats) = update.completed_attempt {
                         tracing::info!(
                             peer = %peer_id,
                             attempt_id = stats.attempt_id,
-                            connection_id = ?connection_id,
                             elapsed_ms = stats.elapsed_ms(),
                             dials_started = stats.dials_started,
                             dial_failures = stats.dials_failed,
                             last_dial_error = ?stats.last_dial_error,
+                            direct_connections,
+                            relayed_connections,
+                            known_addrs = ?known_addrs_for_peer(&app_state, peer_id),
                             "hole punch succeeded; direct connection established"
                         );
                     }
@@ -288,9 +305,9 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     }
 
                     if update.peer_fully_disconnected {
-                        tracing::debug!(
+                        tracing::info!(
                             peer = %peer_id,
-                            "peer fully disconnected; cleared hole-punch attempt state"
+                            "peer disconnected"
                         );
                     }
                 }
@@ -522,10 +539,11 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             remote_peer,
                             reason,
                         } => {
-                            tracing::debug!(
+                            tracing::warn!(
                                 peer = %remote_peer,
                                 %reason,
-                                "ignoring raw DCUtR failure event; retries are attempt-scoped"
+                                nat = %nat_type_summary(nat_mapping, &observed_nat_ports),
+                                "hole punch failed (DCUtR reported error)"
                             );
                             continue;
                         }

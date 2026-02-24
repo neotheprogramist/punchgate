@@ -1,14 +1,16 @@
-[workspace]
-resolver = "3"
-members = ["cli"]
-
-[workspace.package]
+[package]
+name = "punchgate"
 version = "0.1.0"
 edition = "2024"
 
-[workspace.dependencies]
-anyhow = "1.0.101"
-clap = { version = "4.5.59", features = ["derive", "env"] }
+[features]
+default = ["autonat"]
+mdns = ["libp2p/mdns"]
+autonat = ["libp2p/autonat"]
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.5.60", features = ["derive", "env"] }
 crab_nat = "0.7.3"
 default-net = "0.22.0"
 futures = "0.3.32"
@@ -28,16 +30,16 @@ libp2p = { version = "0.56.0", features = [
 ] }
 libp2p-stream = "0.4.0-alpha"
 serde = { version = "1.0.228", features = ["derive"] }
-socket2 = { version = "0.5", features = ["all"] }
 serde_json = "1.0.149"
 igd-next = { version = "0.16.2", features = ["aio_tokio"] }
-itertools = "0.14.0"
-proptest = "1.10.0"
-tempfile = "3.25.0"
 stun = "0.17.1"
-strum = { version = "0.27.2", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["compat"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[dev-dependencies]
+proptest = "1.10.0"
+tempfile = "3.26.0"
