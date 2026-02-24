@@ -572,8 +572,19 @@ impl MealyMachine for TunnelState {
             }
 
             Event::TunnelDialFailed { peer, reason } => {
+                let awaiting_direct = self.awaiting_holepunch.contains_key(&peer);
+                let pending_tunnel = self.pending_by_peer.contains_key(&peer);
+                if !awaiting_direct && !pending_tunnel {
+                    tracing::debug!(
+                        %peer,
+                        %reason,
+                        "ignoring tunnel dial failure without active tunnel intent"
+                    );
+                    return (self, commands);
+                }
+
                 tracing::warn!(%peer, %reason, "tunnel dial failed");
-                if self.awaiting_holepunch.contains_key(&peer)
+                if awaiting_direct
                     && let Some(session) = self.holepunch_sessions.get(&peer).cloned()
                 {
                     let addrs = self.prioritized_redial_addrs(&peer, &session);
@@ -586,8 +597,14 @@ impl MealyMachine for TunnelState {
                             attempt_id: session.attempt_id,
                         });
                     }
-                } else {
+                } else if pending_tunnel {
                     self.reroute_specs_after_dial_failure(peer, &mut commands);
+                } else {
+                    tracing::debug!(
+                        %peer,
+                        %reason,
+                        "ignoring tunnel dial failure without pending reroute target"
+                    );
                 }
             }
 
@@ -1319,6 +1336,21 @@ mod tests {
             service_name: service.clone(),
             key: KademliaKey::for_service(&service),
         }));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_without_active_intent_is_noop() {
+        let peer = PeerId::random();
+        let state = TunnelState::new();
+        let before = state.clone();
+
+        let (state, commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "ignored".to_string(),
+        });
+
+        assert!(commands.is_empty());
+        assert_eq!(state, before);
     }
 
     #[test]
