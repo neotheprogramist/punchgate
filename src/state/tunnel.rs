@@ -583,10 +583,28 @@ impl MealyMachine for TunnelState {
                     return (self, commands);
                 }
 
+                if awaiting_direct && is_pending_abort_dial_error(&reason) {
+                    tracing::debug!(
+                        %peer,
+                        %reason,
+                        "ignoring tunnel dial failure caused by aborted in-flight attempt"
+                    );
+                    return (self, commands);
+                }
+
                 tracing::warn!(%peer, %reason, "tunnel dial failed");
                 if awaiting_direct
                     && let Some(session) = self.holepunch_sessions.get(&peer).cloned()
                 {
+                    if matches!(session.phase, HolePunchPhase::WaitingDisconnect) {
+                        tracing::debug!(
+                            %peer,
+                            attempt_id = session.attempt_id,
+                            %reason,
+                            "ignoring tunnel dial failure while waiting for relay disconnect"
+                        );
+                        return (self, commands);
+                    }
                     let addrs = self.prioritized_redial_addrs(&peer, &session);
                     if addrs.is_empty() {
                         commands.push(Command::DialPeer { peer });
@@ -788,6 +806,10 @@ fn has_udp_and_quic(addr: &Multiaddr) -> bool {
 
 fn is_supported_direct_candidate(addr: &Multiaddr) -> bool {
     !has_p2p_circuit(addr) && has_udp_and_quic(addr) && crate::external_addr::has_public_ip(addr)
+}
+
+fn is_pending_abort_dial_error(reason: &str) -> bool {
+    reason.contains("Pending connection attempt has been aborted")
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1448,6 +1470,68 @@ mod tests {
             addrs: vec![direct_addr],
             attempt_id: 9,
         }));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_pending_abort_is_ignored_while_waiting_disconnect() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 12,
+        });
+        let (state, timeout_commands) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 12,
+        });
+        assert!(timeout_commands.contains(&Command::DisconnectPeer { peer }));
+
+        let (state, commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "Dial error: Pending connection attempt has been aborted.".to_string(),
+        });
+
+        assert!(commands.is_empty());
+        assert!(state.pending_retry_redial.contains(&peer));
+        assert!(matches!(
+            state.holepunch_sessions.get(&peer).map(|s| &s.phase),
+            Some(HolePunchPhase::WaitingDisconnect)
+        ));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_is_ignored_while_waiting_disconnect() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 13,
+        });
+        let (state, timeout_commands) = state.transition(Event::HolePunchAttemptTimeout {
+            peer,
+            attempt_id: 13,
+        });
+        assert!(timeout_commands.contains(&Command::DisconnectPeer { peer }));
+
+        let (state, commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+
+        assert!(commands.is_empty());
+        assert!(state.pending_retry_redial.contains(&peer));
+        assert!(matches!(
+            state.holepunch_sessions.get(&peer).map(|s| &s.phase),
+            Some(HolePunchPhase::WaitingDisconnect)
+        ));
     }
 
     #[test]
