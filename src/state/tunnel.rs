@@ -102,6 +102,22 @@ impl TunnelState {
         self.pending_by_peer.contains_key(peer)
     }
 
+    pub fn has_holepunch_intent(&self, peer: &PeerId) -> bool {
+        self.pending_by_peer.contains_key(peer) || self.awaiting_holepunch.contains_key(peer)
+    }
+
+    pub fn holepunch_target_peers(&self) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = self
+            .pending_by_peer
+            .keys()
+            .chain(self.awaiting_holepunch.keys())
+            .copied()
+            .collect();
+        peers.sort_by_key(ToString::to_string);
+        peers.dedup();
+        peers
+    }
+
     fn store_provider_candidates(&mut self, service_name: &ServiceName, providers: Vec<PeerId>) {
         let providers = dedup_peers(providers);
         if providers.is_empty() {

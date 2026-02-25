@@ -96,36 +96,18 @@ impl ConnectionStateMachine {
         peer: PeerId,
         connection_id: ConnectionId,
         relayed: bool,
-        hole_punch_timeout: Duration,
     ) -> ConnectionEstablishedUpdate {
         self.pending_hole_punch_dials.remove(&connection_id);
 
         match relayed {
             true => {
-                let relayed_ids = self.relayed_connections.entry(peer).or_default();
-                let first_relayed_connection = relayed_ids.is_empty();
-                relayed_ids.insert(connection_id);
-
-                let started_attempt_id =
-                    match first_relayed_connection && !self.has_direct_connection(&peer) {
-                        true => {
-                            let attempt_id = self.next_hole_punch_attempt_id(peer);
-                            self.hole_punch_attempts
-                                .insert(peer, HolePunchAttemptStats::new(attempt_id));
-                            self.hole_punch_deadlines.insert(
-                                peer,
-                                HolePunchDeadline {
-                                    attempt_id,
-                                    deadline: tokio::time::Instant::now() + hole_punch_timeout,
-                                },
-                            );
-                            Some(attempt_id)
-                        }
-                        false => None,
-                    };
+                self.relayed_connections
+                    .entry(peer)
+                    .or_default()
+                    .insert(connection_id);
 
                 ConnectionEstablishedUpdate {
-                    started_attempt_id,
+                    started_attempt_id: None,
                     completed_attempt: None,
                     relayed_connections_to_close: Vec::new(),
                     direct_connection_established: false,
@@ -152,6 +134,28 @@ impl ConnectionStateMachine {
                 }
             }
         }
+    }
+
+    pub(super) fn start_hole_punch_attempt(
+        &mut self,
+        peer: PeerId,
+        hole_punch_timeout: Duration,
+    ) -> Option<u64> {
+        if !self.peer_is_relay_only(&peer) || self.hole_punch_attempts.contains_key(&peer) {
+            return None;
+        }
+
+        let attempt_id = self.next_hole_punch_attempt_id(peer);
+        self.hole_punch_attempts
+            .insert(peer, HolePunchAttemptStats::new(attempt_id));
+        self.hole_punch_deadlines.insert(
+            peer,
+            HolePunchDeadline {
+                attempt_id,
+                deadline: tokio::time::Instant::now() + hole_punch_timeout,
+            },
+        );
+        Some(attempt_id)
     }
 
     pub(super) fn on_connection_closed(
@@ -354,8 +358,9 @@ mod tests {
     fn stale_zero_count_disconnect_does_not_drop_new_relay_connection() {
         let peer = PeerId::random();
         let mut machine = ConnectionStateMachine::new();
-        let _ = machine.on_connection_established(peer, cid(1), true, Duration::from_secs(15));
-        let _ = machine.on_connection_established(peer, cid(2), true, Duration::from_secs(15));
+        let _ = machine.on_connection_established(peer, cid(1), true);
+        let _ = machine.start_hole_punch_attempt(peer, Duration::from_secs(15));
+        let _ = machine.on_connection_established(peer, cid(2), true);
 
         let update = machine.on_connection_closed(peer, cid(1), 0);
 
@@ -372,8 +377,10 @@ mod tests {
             let timeout = Duration::from_secs(15);
 
             for i in 0..cycles {
-                let established = machine.on_connection_established(peer, cid(i * 2 + 1), true, timeout);
-                prop_assert!(established.started_attempt_id.is_some());
+                let established = machine.on_connection_established(peer, cid(i * 2 + 1), true);
+                let started = machine.start_hole_punch_attempt(peer, timeout);
+                prop_assert!(established.started_attempt_id.is_none());
+                prop_assert!(started.is_some());
                 let closed = machine.on_connection_closed(peer, cid(i * 2 + 1), 0);
                 prop_assert!(closed.peer_fully_disconnected);
                 prop_assert_eq!(machine.relayed_connection_count(&peer), 0);

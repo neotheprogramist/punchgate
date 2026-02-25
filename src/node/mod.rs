@@ -233,8 +233,14 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         *peer_id,
                         *connection_id,
                         is_relayed,
-                        HOLE_PUNCH_TIMEOUT,
                     );
+                    let started_attempt_id = if is_relayed
+                        && app_state.tunnel.has_holepunch_intent(peer_id)
+                    {
+                        connection_state.start_hole_punch_attempt(*peer_id, HOLE_PUNCH_TIMEOUT)
+                    } else {
+                        None
+                    };
                     let relayed_connections = connection_state.relayed_connection_count(peer_id);
                     let direct_connections = connection_state.direct_connection_count(peer_id);
                     if relayed_connections + direct_connections == 1 {
@@ -247,7 +253,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                         );
                     }
 
-                    if let Some(attempt_id) = update.started_attempt_id {
+                    if let Some(attempt_id) = started_attempt_id.or(update.started_attempt_id) {
                         synthetic_events.push(Event::HolePunchAttemptStarted {
                             peer: *peer_id,
                             attempt_id,
@@ -809,6 +815,13 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     log_phase_transition(old_phase, new_state.phase(), commands.len());
                     app_state = new_state;
                     execute_commands(&mut swarm, &commands, &config.exposed, &mut ctx);
+                    app_state = arm_hole_punch_for_tunnel_targets(
+                        app_state,
+                        &mut connection_state,
+                        &mut swarm,
+                        &config.exposed,
+                        &mut ctx,
+                    );
 
                     match app_state.phase() {
                         Phase::ShuttingDown => {
@@ -1006,6 +1019,45 @@ fn log_phase_transition(old: Phase, new: Phase, commands: usize) {
             );
         }
     }
+}
+
+fn arm_hole_punch_for_tunnel_targets(
+    mut app_state: AppState,
+    connection_state: &mut ConnectionStateMachine,
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    exposed: &[ExposedService],
+    ctx: &mut ExecutionContext,
+) -> AppState {
+    if matches!(app_state.phase(), Phase::ShuttingDown) {
+        return app_state;
+    }
+    let target_peers = app_state.tunnel.holepunch_target_peers();
+    for peer in target_peers {
+        let Some(attempt_id) = connection_state.start_hole_punch_attempt(peer, HOLE_PUNCH_TIMEOUT)
+        else {
+            continue;
+        };
+        let known_addrs = known_addrs_for_peer(&app_state, &peer);
+        let old_phase = app_state.phase();
+        let (new_state, commands) =
+            app_state.transition(Event::HolePunchAttemptStarted { peer, attempt_id });
+        tracing::info!(
+            peer = %peer,
+            attempt_id,
+            timeout_secs = HOLE_PUNCH_TIMEOUT.as_secs(),
+            known_addrs = ?known_addrs,
+            "hole punch started"
+        );
+        tracing::debug!(
+            event = "HolePunchAttemptStarted",
+            commands = commands.len(),
+            "event processed"
+        );
+        log_phase_transition(old_phase, new_state.phase(), commands.len());
+        app_state = new_state;
+        execute_commands(swarm, &commands, exposed, ctx);
+    }
+    app_state
 }
 
 #[derive(Debug, Clone, Copy, Default)]
