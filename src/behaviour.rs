@@ -28,7 +28,12 @@ impl Behaviour {
     pub fn new(keypair: &Keypair, relay_client: relay::client::Behaviour) -> Result<Self> {
         let peer_id = PeerId::from(keypair.public());
 
-        let kad_config = kad::Config::new(protocol::kad_protocol());
+        let mut kad_config = kad::Config::new(protocol::kad_protocol());
+        kad_config
+            .set_record_ttl(Some(protocol::DHT_RECORD_TTL))
+            .set_publication_interval(Some(protocol::DHT_RECORD_REFRESH_INTERVAL))
+            .set_provider_record_ttl(Some(protocol::DHT_PROVIDER_TTL))
+            .set_provider_publication_interval(Some(protocol::DHT_PROVIDER_REFRESH_INTERVAL));
         let store = kad::store::MemoryStore::new(peer_id);
         let kademlia = kad::Behaviour::with_config(peer_id, store, kad_config);
 

@@ -42,17 +42,6 @@ pub fn translate_swarm_event(
             });
         }
 
-        SwarmEvent::ConnectionClosed {
-            peer_id,
-            num_established,
-            ..
-        } => {
-            events.push(Event::ConnectionLost {
-                peer: *peer_id,
-                remaining_connections: *num_established,
-            });
-        }
-
         SwarmEvent::Behaviour(behaviour_event) => {
             events.extend(translate_behaviour_event(
                 behaviour_event,
@@ -121,6 +110,9 @@ pub fn translate_swarm_event(
         SwarmEvent::IncomingConnection { .. }
         | SwarmEvent::IncomingConnectionError { .. }
         | SwarmEvent::ExpiredListenAddr { .. }
+        // ConnectionClosed is synthesized from ConnectionStateMachine in node/mod.rs
+        // to avoid stale `num_established` races during rapid reconnects.
+        | SwarmEvent::ConnectionClosed { .. }
         | SwarmEvent::Dialing { .. }
         | SwarmEvent::NewExternalAddrCandidate { .. }
         | SwarmEvent::NewExternalAddrOfPeer { .. } => {}

@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use libp2p::{
     Multiaddr, PeerId, kad,
-    swarm::dial_opts::{DialOpts, PeerCondition},
+    swarm::{
+        DialError,
+        dial_opts::{DialOpts, PeerCondition},
+    },
 };
 
 use crate::{
@@ -84,10 +87,16 @@ pub fn execute_commands(
             }
             Command::DialPeer { peer } => {
                 let opts = DialOpts::peer_id(*peer)
-                    .condition(PeerCondition::Always)
+                    .condition(PeerCondition::NotDialing)
                     .build();
                 match swarm.dial(opts) {
                     Ok(()) => tracing::info!(%peer, "dialing tunnel target"),
+                    Err(DialError::DialPeerConditionFalse(PeerCondition::NotDialing)) => {
+                        tracing::debug!(
+                            %peer,
+                            "skipping dial: another dial attempt is already in progress"
+                        );
+                    }
                     Err(e) => tracing::error!(%peer, error = %e, "failed to dial tunnel target"),
                 }
             }
@@ -98,7 +107,7 @@ pub fn execute_commands(
             } => {
                 let opts = DialOpts::peer_id(*peer)
                     .addresses(addrs.clone())
-                    .condition(PeerCondition::Always)
+                    .condition(PeerCondition::NotDialing)
                     .build();
                 match swarm.dial(opts) {
                     Ok(()) => tracing::info!(
@@ -107,6 +116,13 @@ pub fn execute_commands(
                         addrs = ?addrs,
                         "dialing tunnel target with prioritized hole-punch addresses"
                     ),
+                    Err(DialError::DialPeerConditionFalse(PeerCondition::NotDialing)) => {
+                        tracing::debug!(
+                            %peer,
+                            attempt_id,
+                            "skipping prioritized dial: another dial attempt is already in progress"
+                        );
+                    }
                     Err(e) => tracing::error!(
                         %peer,
                         attempt_id,
@@ -147,6 +163,7 @@ pub fn execute_commands(
 pub fn publish_services(swarm: &mut libp2p::Swarm<Behaviour>, exposed: &[ExposedService]) {
     for svc in exposed {
         let key = KademliaKey::for_service(&svc.name);
+        let local_peer = *swarm.local_peer_id();
         match swarm
             .behaviour_mut()
             .kademlia
@@ -163,7 +180,9 @@ pub fn publish_services(swarm: &mut libp2p::Swarm<Behaviour>, exposed: &[Exposed
                 continue;
             }
         };
-        let record = kad::Record::new(key.into_record_key(), metadata);
+        let mut record = kad::Record::new(key.into_record_key(), metadata);
+        record.publisher = Some(local_peer);
+        record.expires = Some(Instant::now() + crate::protocol::DHT_RECORD_TTL);
         match swarm
             .behaviour_mut()
             .kademlia

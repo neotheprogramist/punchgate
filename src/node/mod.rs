@@ -224,6 +224,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                 }
 
                 let mut synthetic_events = Vec::new();
+                let mut bootstrap_fully_disconnected: Option<PeerId> = None;
 
                 if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } = &event {
                     let is_relayed = endpoint_is_relayed(endpoint);
@@ -299,12 +300,23 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     );
                     let update =
                         connection_state.on_connection_closed(*peer_id, *connection_id, *num_established);
+                    let remaining_connections = connection_state
+                        .relayed_connection_count(peer_id)
+                        .saturating_add(connection_state.direct_connection_count(peer_id))
+                        as u32;
+                    synthetic_events.push(Event::ConnectionLost {
+                        peer: *peer_id,
+                        remaining_connections,
+                    });
 
                     if update.clear_direct_registry {
                         ctx.direct_peers.clear_direct(peer_id).await;
                     }
 
                     if update.peer_fully_disconnected {
+                        if bootstrap_peer_ids.contains(peer_id) {
+                            bootstrap_fully_disconnected = Some(*peer_id);
+                        }
                         tracing::info!(
                             peer = %peer_id,
                             "peer disconnected"
@@ -319,14 +331,13 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                     pending_reconnects.remove(peer_id);
                 }
 
-                if let SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } = &event
-                    && bootstrap_peer_ids.contains(peer_id)
-                    && let Some((_, delay)) = backoff.schedule_reconnect(*peer_id)
+                if let Some(peer_id) = bootstrap_fully_disconnected
+                    && let Some((_, delay)) = backoff.schedule_reconnect(peer_id)
                 {
                     let deadline = tokio::time::Instant::now() + delay;
-                    pending_reconnects.insert(*peer_id, deadline);
+                    pending_reconnects.insert(peer_id, deadline);
                     tracing::debug!(
-                        %peer_id,
+                        peer_id = %peer_id,
                         delay_secs = delay.as_secs(),
                         "scheduling bootstrap reconnect"
                     );
