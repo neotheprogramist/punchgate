@@ -363,8 +363,6 @@ impl TunnelState {
                 session.direct_snapshot = direct_addrs.clone();
             }
             if snapshots_changed {
-                // Allow one additional retry dial if we learned fresher candidates
-                // during an active hole-punch attempt.
                 session.dial_retry_dispatched = false;
             }
             if backfilled_relay || backfilled_direct {
@@ -620,6 +618,23 @@ impl MealyMachine for TunnelState {
                 if awaiting_direct
                     && let Some(session) = self.holepunch_sessions.get(&peer).cloned()
                 {
+                    if matches!(session.phase, HolePunchPhase::Punching)
+                        && is_handshake_timeout_dial_error(&reason)
+                    {
+                        tracing::info!(
+                            %peer,
+                            attempt_id = session.attempt_id,
+                            "direct handshake timed out during hole-punch attempt; advancing retry"
+                        );
+                        self.retry_holepunch_attempt(
+                            peer,
+                            session.attempt_id,
+                            "direct handshake timeout",
+                            &mut commands,
+                        );
+                        return (self, commands);
+                    }
+
                     if matches!(session.phase, HolePunchPhase::WaitingDisconnect) {
                         tracing::debug!(
                             %peer,
@@ -857,6 +872,10 @@ fn is_supported_direct_candidate(addr: &Multiaddr) -> bool {
 
 fn is_pending_abort_dial_error(reason: &str) -> bool {
     reason.contains("Pending connection attempt has been aborted")
+}
+
+fn is_handshake_timeout_dial_error(reason: &str) -> bool {
+    reason.contains("Handshake with the remote timed out")
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1517,6 +1536,45 @@ mod tests {
             addrs: vec![direct_addr],
             attempt_id: 9,
         }));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_handshake_timeout_fast_tracks_holepunch_retry() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 21,
+        });
+
+        let timeout_reason =
+            "Failed to negotiate transport protocol(s): Handshake with the remote timed out.";
+        let (state, commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: timeout_reason.to_string(),
+        });
+
+        assert!(commands.contains(&Command::DisconnectPeer { peer }));
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| matches!(cmd, Command::DialPeer { .. }))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|cmd| matches!(cmd, Command::DialPeerWithAddrs { .. }))
+        );
+        assert!(state.pending_retry_redial.contains(&peer));
+        assert_eq!(state.holepunch_retry_attempts.get(&peer).copied(), Some(1));
+        assert!(matches!(
+            state.holepunch_sessions.get(&peer).map(|s| &s.phase),
+            Some(HolePunchPhase::WaitingDisconnect)
+        ));
     }
 
     #[test]
