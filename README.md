@@ -38,6 +38,7 @@ punchgate status
 punchgate logs
 punchgate logs --follow
 punchgate down
+punchgate uninstall
 ```
 
 `punchgate up` writes runtime config and creates a per-user service:
@@ -45,6 +46,9 @@ punchgate down
 - macOS: `~/Library/LaunchAgents/com.punchgate.daemon.plist`
 - Linux: `~/.config/systemd/user/punchgate.service`
 - Env file: `~/.config/punchgate/punchgate.env`
+
+`punchgate down` (or `punchgate uninstall`) stops and unregisters the
+background service by removing the user unit/agent file.
 
 Service-mode configuration example (provider):
 

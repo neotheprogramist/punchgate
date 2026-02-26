@@ -60,6 +60,7 @@ enum ServiceCommand {
     /// Install/update and start background service.
     Up,
     /// Stop and uninstall/disable background service.
+    #[command(visible_alias = "uninstall", visible_alias = "unregister")]
     Down,
     /// Show background service status.
     Status,
@@ -306,10 +307,20 @@ fn run_linux_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
                 "--now",
                 SYSTEMD_SERVICE_NAME,
             ]))?;
+            if service_path.exists() {
+                fs::remove_file(&service_path)
+                    .with_context(|| format!("failed to remove {}", service_path.display()))?;
+                tracing::info!(path = %service_path.display(), "removed service unit");
+            }
             run_allow_failure(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+            run_allow_failure(Command::new("systemctl").args([
+                "--user",
+                "reset-failed",
+                SYSTEMD_SERVICE_NAME,
+            ]))?;
             tracing::info!(
                 service = SYSTEMD_SERVICE_NAME,
-                "service stopped and disabled"
+                "service stopped and unregistered"
             );
         }
         ServiceCommand::Status => {
@@ -404,7 +415,12 @@ fn run_macos_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
                 &plist_path_string(&plist_path),
             ]))?;
             run_allow_failure(Command::new("launchctl").args(["disable", &label_handle]))?;
-            tracing::info!(service = SERVICE_LABEL, "service stopped");
+            if plist_path.exists() {
+                fs::remove_file(&plist_path)
+                    .with_context(|| format!("failed to remove {}", plist_path.display()))?;
+                tracing::info!(path = %plist_path.display(), "removed launch agent");
+            }
+            tracing::info!(service = SERVICE_LABEL, "service stopped and unregistered");
         }
         ServiceCommand::Status => {
             run_checked(Command::new("launchctl").args(["print", &label_handle]))?;
