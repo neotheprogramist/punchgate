@@ -313,11 +313,6 @@ fn run_linux_service_command(cli: &Cli, command: &ServiceCommand) -> Result<()> 
                 tracing::info!(path = %service_path.display(), "removed service unit");
             }
             run_allow_failure(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_allow_failure(Command::new("systemctl").args([
-                "--user",
-                "reset-failed",
-                SYSTEMD_SERVICE_NAME,
-            ]))?;
             tracing::info!(
                 service = SYSTEMD_SERVICE_NAME,
                 "service stopped and unregistered"
