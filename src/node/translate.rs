@@ -221,7 +221,7 @@ fn translate_behaviour_event(
 
         BehaviourEvent::Dcutr(event) => match &event.result {
             Ok(connection_id) => {
-                tracing::debug!(
+                tracing::info!(
                     peer = %event.remote_peer_id,
                     connection_id = ?connection_id,
                     "dcutr upgraded relayed path to direct connection"
@@ -229,7 +229,7 @@ fn translate_behaviour_event(
                 vec![]
             }
             Err(e) => {
-                tracing::debug!(
+                tracing::info!(
                     peer = %event.remote_peer_id,
                     error = %e,
                     "dcutr reported hole-punch failure (raw event; attempt-scoped retry logic is authoritative)"

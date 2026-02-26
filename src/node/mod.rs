@@ -281,7 +281,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
                             direct_connections,
                             relayed_connections,
                             known_addrs = ?known_addrs_for_peer(&app_state, peer_id),
-                            "hole punch succeeded; direct connection established"
+                            "hole punch succeeded (DCUtR); direct connection established"
                         );
                     }
 

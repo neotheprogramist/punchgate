@@ -34,6 +34,7 @@ struct HolePunchSession {
     phase: HolePunchPhase,
     relay_redial_addrs: Vec<Multiaddr>,
     direct_snapshot: Vec<Multiaddr>,
+    dial_retry_dispatched: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,11 +354,18 @@ impl TunnelState {
             let refreshed_direct = !session.direct_snapshot.is_empty()
                 && !direct_addrs.is_empty()
                 && session.direct_snapshot != direct_addrs;
+            let snapshots_changed =
+                backfilled_relay || backfilled_direct || refreshed_relay || refreshed_direct;
             if backfilled_relay || refreshed_relay {
                 session.relay_redial_addrs = relay_addrs.clone();
             }
             if backfilled_direct || refreshed_direct {
                 session.direct_snapshot = direct_addrs.clone();
+            }
+            if snapshots_changed {
+                // Allow one additional retry dial if we learned fresher candidates
+                // during an active hole-punch attempt.
+                session.dial_retry_dispatched = false;
             }
             if backfilled_relay || backfilled_direct {
                 tracing::debug!(
@@ -407,6 +415,7 @@ impl TunnelState {
                 phase: HolePunchPhase::Punching,
                 relay_redial_addrs: oracle.relay_addrs,
                 direct_snapshot: oracle.direct_addrs,
+                dial_retry_dispatched: false,
             },
         );
     }
@@ -608,7 +617,6 @@ impl MealyMachine for TunnelState {
                     return (self, commands);
                 }
 
-                tracing::warn!(%peer, %reason, "tunnel dial failed");
                 if awaiting_direct
                     && let Some(session) = self.holepunch_sessions.get(&peer).cloned()
                 {
@@ -621,6 +629,28 @@ impl MealyMachine for TunnelState {
                         );
                         return (self, commands);
                     }
+
+                    if session.dial_retry_dispatched {
+                        tracing::debug!(
+                            %peer,
+                            attempt_id = session.attempt_id,
+                            %reason,
+                            "suppressing repeated tunnel dial failure while hole-punch retry dial is already scheduled"
+                        );
+                        return (self, commands);
+                    }
+
+                    tracing::debug!(
+                        %peer,
+                        attempt_id = session.attempt_id,
+                        %reason,
+                        "tunnel dial failed during hole-punch attempt; scheduling prioritized retry"
+                    );
+                    if let Some(active_session) = self.holepunch_sessions.get_mut(&peer)
+                        && active_session.attempt_id == session.attempt_id
+                    {
+                        active_session.dial_retry_dispatched = true;
+                    }
                     let addrs = self.prioritized_redial_addrs(&peer, &session);
                     if addrs.is_empty() {
                         commands.push(Command::DialPeer { peer });
@@ -632,6 +662,7 @@ impl MealyMachine for TunnelState {
                         });
                     }
                 } else if pending_tunnel {
+                    tracing::warn!(%peer, %reason, "tunnel dial failed");
                     self.reroute_specs_after_dial_failure(peer, &mut commands);
                 } else {
                     tracing::debug!(
@@ -1485,6 +1516,109 @@ mod tests {
             peer,
             addrs: vec![direct_addr],
             attempt_id: 9,
+        }));
+    }
+
+    #[test]
+    fn tunnel_dial_failed_during_holepunch_suppresses_duplicate_redials_per_attempt() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let direct_addr: Multiaddr = "/ip4/81.219.135.162/udp/47207/quic-v1"
+            .parse()
+            .expect("valid direct address");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 10,
+        });
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![direct_addr.clone()],
+            observed_addr: direct_addr.clone(),
+        });
+
+        let (state, first_commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+        assert!(first_commands.contains(&Command::DialPeerWithAddrs {
+            peer,
+            addrs: vec![direct_addr],
+            attempt_id: 10,
+        }));
+
+        let (state, second_commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+        assert!(
+            second_commands.is_empty(),
+            "only one retry dial should be scheduled per hole-punch attempt"
+        );
+        assert!(
+            state
+                .holepunch_sessions
+                .get(&peer)
+                .is_some_and(|s| s.dial_retry_dispatched),
+            "attempt should remember that a retry dial was already dispatched"
+        );
+    }
+
+    #[test]
+    fn tunnel_dial_failed_reenables_retry_after_fresh_identify_candidates() {
+        let peer = PeerId::random();
+        let service = ServiceName::new("svc");
+        let bind: ServiceAddr = "localhost:2222".parse().expect("valid service addr");
+        let direct_addr: Multiaddr = "/ip4/81.219.135.162/udp/47207/quic-v1"
+            .parse()
+            .expect("valid direct address");
+
+        let mut state = TunnelState::new();
+        state.awaiting_holepunch.insert(peer, vec![(service, bind)]);
+        let (state, _) = state.transition(Event::HolePunchAttemptStarted {
+            peer,
+            attempt_id: 11,
+        });
+
+        let (state, first_commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+        assert!(first_commands.contains(&Command::DialPeer { peer }));
+
+        let (state, second_commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+        assert!(
+            second_commands.is_empty(),
+            "duplicate failures should be suppressed without new address candidates"
+        );
+
+        let (state, _) = state.transition(Event::PeerIdentified {
+            peer,
+            listen_addrs: vec![direct_addr.clone()],
+            observed_addr: direct_addr.clone(),
+        });
+        assert!(
+            state
+                .holepunch_sessions
+                .get(&peer)
+                .is_some_and(|s| !s.dial_retry_dispatched),
+            "fresh identify candidates should re-enable one retry dial in the same attempt"
+        );
+
+        let (_, third_commands) = state.transition(Event::TunnelDialFailed {
+            peer,
+            reason: "temporary network failure".to_string(),
+        });
+        assert!(third_commands.contains(&Command::DialPeerWithAddrs {
+            peer,
+            addrs: vec![direct_addr],
+            attempt_id: 11,
         }));
     }
 
